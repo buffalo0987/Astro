@@ -1,0 +1,2 @@
+# Prevent gvfs/udisks2 from stealing the Canon EOS M200 USB PTP interface
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="04a9", ENV{GPHOTO2_DRIVER}=="1", ENV{UDISKS_IGNORE}="1", ENV{GVFS_DISABLE_FUSE}="1", MODE="0666", GROUP="plugdev"

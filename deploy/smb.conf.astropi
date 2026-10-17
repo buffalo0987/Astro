@@ -1,0 +1,21 @@
+# AstroPi Zero-Config SMB3 Share Configuration for Windows Explorer & macOS Finder
+# Included from /etc/samba/smb.conf by deploy/install.sh
+
+[global]
+   server min protocol = SMB2
+   use sendfile = yes
+   min receivefile size = 16384
+   aio read size = 16384
+   aio write size = 16384
+   map to guest = Bad User
+   vfs objects = fruit streams_xattr
+
+[captures]
+   comment = AstroPi Siril & WBPP Capture Storage
+   path = /var/lib/astropi/captures
+   browseable = yes
+   read only = no
+   guest ok = yes
+   create mask = 0664
+   directory mask = 0775
+   force user = root

@@ -1,0 +1,18 @@
+{
+  "name": "AstroPi Field Observatory",
+  "short_name": "AstroPi",
+  "description": "Headless Polar Alignment, Push-To Framing, Focus & .CR3 Sequencing PWA for Canon EOS M200 + Star Adventurer 2i",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
