@@ -193,10 +193,14 @@ class TestAstroPiSuite(unittest.TestCase):
         st_frame_after = self.client.get("/api/camera/status").json()
         self.assertEqual(st_frame_after["image_format"], "RAW (.CR3)")
 
-        # 5. Live Preview Loop and Camera Connect
+        # 5. Live Preview Loop and Camera Connect & Config
         r_conn = self.client.post("/api/camera/connect")
         self.assertEqual(r_conn.status_code, 200)
         self.assertIn("driver_mode", r_conn.json())
+
+        r_cfg = self.client.post("/api/camera/config", json={"iso": "1600", "exposure_s": 2.0})
+        self.assertEqual(r_cfg.status_code, 200)
+        self.assertEqual(r_cfg.json()["iso"], "1600")
 
         r_loop_start = self.client.post("/api/camera/live-loop/start", json={"exposure_s": 1.0, "iso": "800"})
         self.assertEqual(r_loop_start.status_code, 200)

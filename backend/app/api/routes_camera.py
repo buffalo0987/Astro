@@ -133,9 +133,35 @@ async def abort_exposure() -> Dict[str, Any]:
     return {"aborted": True, "camera": CAMERA.status_dict()}
 
 
+@router.post("/config")
+async def set_camera_config(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Set ISO, shutter speed, or capture settings directly on the physical camera."""
+    body = payload or {}
+    iso = body.get("iso")
+    exposure_s = body.get("exposure_s")
+    if iso is not None:
+        await CAMERA.set_iso(str(iso))
+    if exposure_s is not None:
+        await CAMERA.set_shutter_speed(float(exposure_s))
+    return CAMERA.status_dict()
+
+
 @router.post("/capture")
 async def capture_manual_preview(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     """Capture a single test frame, run MTF auto-stretch + HFR, and restore RAW (.CR3) if requested."""
+    global _preview_loop_task
+    was_live_running = _preview_loop_task is not None and not _preview_loop_task.done()
+    if was_live_running:
+        _preview_loop_stop.set()
+        if _preview_loop_task is not None:
+            _preview_loop_task.cancel()
+            try:
+                await _preview_loop_task
+            except Exception:
+                pass
+        _preview_loop_task = None
+        await asyncio.sleep(0.30)
+
     body = payload or {}
     exposure_s = float(body.get("exposure_s", 2.0))
     iso = str(body.get("iso", "800"))
@@ -187,9 +213,14 @@ async def capture_manual_preview(payload: Dict[str, Any] = None) -> Dict[str, An
         )
         await STATE.broadcast("PREVIEW_UPDATED", STATE.latest_preview)
         return {"preview": STATE.latest_preview, "metrics": metrics}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Camera error: {exc}")
     finally:
         if restore_raw_after:
             await CAMERA.ensure_raw_format()
+        if was_live_running:
+            _preview_loop_stop.clear()
+            _preview_loop_task = asyncio.create_task(_preview_loop_worker())
 
 
 @router.get("/preview.jpg")

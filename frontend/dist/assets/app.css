@@ -194,6 +194,32 @@ body {
   background: var(--warn-bg);
 }
 
+.ctrl-sel {
+  height: 32px;
+  background: var(--bg-card);
+  color: var(--text-main);
+  border: 1px solid var(--border-col);
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 6px;
+  outline: none;
+  cursor: pointer;
+}
+.ctrl-sel:focus {
+  border-color: var(--accent);
+}
+
+#sky-canvas {
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  display: block;
+  border-radius: 8px;
+  background: #000;
+  border: 1px solid var(--border-col);
+  object-fit: contain;
+}
+
 .seg-bar {
   display: grid;
   grid-template-columns: 1fr 1fr;

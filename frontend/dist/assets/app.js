@@ -32,6 +32,8 @@
     zoom: 1.0,
     liveLoopRunning: false,
     catalogLoading: false,
+    manualExposure: '2',
+    manualIso: '1600',
   };
 
   // Web Audio Cues for Dark-Sky Eyes-Free Operation
@@ -163,8 +165,38 @@
         const msg = JSON.parse(ev.data);
         if (msg.type === 'STATE_SNAPSHOT' || msg.type === 'FRAME_SAVED') {
           store.state = msg.payload;
+          render();
         } else if (store.state) {
-          if (msg.type === 'CAMERA_STATUS' || msg.type === 'EXPOSURE_TICK') {
+          if (msg.type === 'PREVIEW_UPDATED') {
+            store.state.preview = msg.payload;
+            renderPreviewCanvas();
+            const histCont = document.getElementById('hist-container');
+            if (histCont && msg.payload?.histogram) {
+              histCont.innerHTML = renderHistogramSvg(msg.payload.histogram);
+            }
+            const srcFmt = document.getElementById('preview-source-fmt');
+            if (srcFmt && msg.payload?.source_format) {
+              srcFmt.textContent = `(${msg.payload.source_format})`;
+            }
+            return;
+          }
+          if (msg.type === 'EXPOSURE_TICK') {
+            store.state.camera = msg.payload;
+            const wrap = document.getElementById('exposure-bar-wrap');
+            if (wrap) {
+              wrap.style.display = msg.payload.exposing ? 'block' : 'none';
+              const textEl = document.getElementById('exposure-bar-text');
+              if (textEl) {
+                textEl.textContent = `${msg.payload.exposure_elapsed_s.toFixed(1)}s / ${msg.payload.exposure_total_s.toFixed(1)}s (${msg.payload.exposure_remaining_s.toFixed(1)}s left)`;
+              }
+              const fillEl = document.getElementById('exposure-bar-fill');
+              if (fillEl) {
+                fillEl.style.width = `${msg.payload.exposure_progress_pct}%`;
+              }
+            }
+            return;
+          }
+          if (msg.type === 'CAMERA_STATUS') {
             store.state.camera = msg.payload;
           } else if (msg.type === 'PA_STATE') {
             if ((msg.payload.points || []).length > (store.state.pa.points || []).length) {
@@ -178,14 +210,12 @@
             if (msg.payload.hfr_median > 0) {
               playTone(Math.max(240, 900 - msg.payload.hfr_median * 110), 90);
             }
-          } else if (msg.type === 'PREVIEW_UPDATED') {
-            store.state.preview = msg.payload;
           } else if (msg.type === 'SEQUENCE_PROGRESS' || msg.type === 'INTERLOCK_PROMPT') {
             if (msg.type === 'INTERLOCK_PROMPT') playTone(440, 220, 'sawtooth');
             store.state.sequence = msg.payload;
           }
+          render();
         }
-        render();
       } catch (_) {}
     };
   }
@@ -194,10 +224,10 @@
     const canvas = document.getElementById('sky-canvas');
     if (!canvas) return;
     const preview = store.state?.preview;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
     if (!preview?.image_url) {
-      canvas.width = 960;
-      canvas.height = 540;
-      const ctx = canvas.getContext('2d');
       ctx.fillStyle = '#0a0a0c';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = store.nightVision ? '#ff1a1a' : '#a1a1aa';
@@ -206,12 +236,11 @@
       ctx.fillText("Tap '▶ Live Viewfinder' or '📸 Test Shot' to see camera view", canvas.width / 2, canvas.height / 2);
       return;
     }
+
     const img = new Image();
     img.onload = () => {
-      canvas.width = img.width || 960;
-      canvas.height = img.height || 640;
-      const ctx = canvas.getContext('2d');
       ctx.save();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (store.zoom > 1.0) {
         const zw = canvas.width / store.zoom;
         const zh = canvas.height / store.zoom;
@@ -992,19 +1021,15 @@
             </button>
           </div>
         </div>
-        ${
-          camera.exposing
-            ? `<div class="exp-bar-wrap">
-                 <div style="display:flex;justify-content:space-between;font-size:11px;font-family:monospace;margin-bottom:2px">
-                   <span>EXPOSING (${camera.shutter_speed} @ ISO ${camera.iso})</span>
-                   <span>${camera.exposure_elapsed_s.toFixed(1)}s / ${camera.exposure_total_s.toFixed(1)}s (${camera.exposure_remaining_s.toFixed(1)}s left)</span>
-                 </div>
-                 <div class="exp-bar-track">
-                   <div class="exp-bar-fill" style="width:${camera.exposure_progress_pct}%"></div>
-                 </div>
-               </div>`
-            : ''
-        }
+        <div class="exp-bar-wrap" id="exposure-bar-wrap" style="display:${camera.exposing ? 'block' : 'none'}">
+          <div style="display:flex;justify-content:space-between;font-size:11px;font-family:monospace;margin-bottom:2px">
+            <span>EXPOSING (${camera.shutter_speed} @ ISO ${camera.iso})</span>
+            <span id="exposure-bar-text">${camera.exposure_elapsed_s.toFixed(1)}s / ${camera.exposure_total_s.toFixed(1)}s (${camera.exposure_remaining_s.toFixed(1)}s left)</span>
+          </div>
+          <div class="exp-bar-track">
+            <div class="exp-bar-fill" id="exposure-bar-fill" style="width:${camera.exposure_progress_pct}%"></div>
+          </div>
+        </div>
       </header>
 
       <nav class="tabs-grid">
@@ -1020,16 +1045,28 @@
           <div class="card-header">
             <div>
               <strong style="font-size:13px">LIVE SKY PREVIEW</strong>
-              <span style="font-size:11px;color:var(--text-muted);margin-left:6px">(${preview?.source_format || 'RAW .CR3'})</span>
+              <span style="font-size:11px;color:var(--text-muted);margin-left:6px" id="preview-source-fmt">(${preview?.source_format || 'RAW .CR3'})</span>
             </div>
-            <div style="display:flex;gap:6px;align-items:center">
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+              <div style="display:flex;align-items:center;gap:3px">
+                <span style="font-size:11px;font-weight:700;color:var(--text-muted)">EXP:</span>
+                <select id="preview-exp-sel" class="ctrl-sel">
+                  ${['0.5', '1', '1.6', '2', '3.2', '5', '8', '10', '15', '20', '30'].map((s) => `<option value="${s}" ${store.manualExposure == s ? 'selected' : ''}>${s}s</option>`).join('')}
+                </select>
+              </div>
+              <div style="display:flex;align-items:center;gap:3px">
+                <span style="font-size:11px;font-weight:700;color:var(--text-muted)">ISO:</span>
+                <select id="preview-iso-sel" class="ctrl-sel">
+                  ${['100', '200', '400', '800', '1600', '3200', '6400'].map((iso) => `<option value="${iso}" ${store.manualIso == iso ? 'selected' : ''}>${iso}</option>`).join('')}
+                </select>
+              </div>
               <button class="btn btn-sm ${store.liveLoopRunning ? 'btn-warn' : ''}" data-action="toggle-live-loop" title="Stream live viewfinder from sensor without physical shutter">
                 ${store.liveLoopRunning ? '⏹ Stop Live View' : '▶ Live Viewfinder'}
               </button>
               <button class="btn btn-sm ${store.zoom > 1 ? 'btn-active' : ''}" data-action="toggle-zoom">
                 🔍 ${store.zoom > 1 ? '2x Zoom' : '1x Fit'}
               </button>
-              <button class="btn btn-sm" data-action="manual-shot">📸 Test Shot</button>
+              <button class="btn btn-sm btn-primary" data-action="manual-shot">📸 Test Shot</button>
             </div>
           </div>
           ${
@@ -1040,8 +1077,8 @@
                  </div>`
               : ''
           }
-          <canvas id="sky-canvas" style="width:100%;border-radius:8px;background:#000;border:1px solid var(--border-col)"></canvas>
-          ${renderHistogramSvg(preview?.histogram)}
+          <canvas id="sky-canvas" width="960" height="640"></canvas>
+          <div id="hist-container">${renderHistogramSvg(preview?.histogram)}</div>
         </div>
       </main>
 
@@ -1085,6 +1122,18 @@
           field === 'frame_type' || field === 'iso' ? t.value : Number(t.value);
         store.planSavedBanner = false;
       }
+    }
+  });
+
+  document.addEventListener('change', async (e) => {
+    const t = e.target;
+    if (!t) return;
+    if (t.id === 'preview-exp-sel') {
+      store.manualExposure = t.value;
+      await api('/api/camera/config', 'POST', { exposure_s: Number(t.value) }).catch(() => {});
+    } else if (t.id === 'preview-iso-sel') {
+      store.manualIso = t.value;
+      await api('/api/camera/config', 'POST', { iso: t.value }).catch(() => {});
     }
   });
 
@@ -1220,7 +1269,11 @@
       await refreshAll();
     } else if (act === 'manual-shot') {
       try {
-        await api('/api/camera/capture', 'POST', { exposure_s: 1.5, iso: '800', fast_jpeg: true });
+        await api('/api/camera/capture', 'POST', {
+          exposure_s: Number(store.manualExposure || 2.0),
+          iso: String(store.manualIso || '1600'),
+          fast_jpeg: true,
+        });
       } catch (err) {
         alert('Camera capture error: ' + err.message);
       }

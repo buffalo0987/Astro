@@ -142,16 +142,67 @@ class CameraController:
             ok, widget = gp.gp_widget_get_child_by_name(cfg, widget_name)
             if ok < gp.GP_OK:
                 return False
-            for val in candidates:
-                try:
-                    widget.set_value(val)
-                    self._gp_camera.set_config(cfg, self._gp_context)
-                    return True
-                except Exception:
-                    continue
+
+            choices = []
+            try:
+                choices = [widget.get_choice(i) for i in range(widget.count_choices())]
+            except Exception:
+                pass
+
+            if choices:
+                for cand in candidates:
+                    for ch in choices:
+                        if cand.lower() == ch.lower() or cand == ch:
+                            widget.set_value(ch)
+                            self._gp_camera.set_config(cfg, self._gp_context)
+                            return True
+                for cand in candidates:
+                    for ch in choices:
+                        if cand in ch:
+                            widget.set_value(ch)
+                            self._gp_camera.set_config(cfg, self._gp_context)
+                            return True
+            else:
+                for val in candidates:
+                    try:
+                        widget.set_value(val)
+                        self._gp_camera.set_config(cfg, self._gp_context)
+                        return True
+                    except Exception:
+                        continue
         except Exception:
             pass
         return False
+
+    def _set_iso_sync(self, iso: str) -> bool:
+        STATE.camera.iso = str(iso)
+        if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
+            return self._set_widget_sync("iso", (str(iso),))
+        return True
+
+    async def set_iso(self, iso: str) -> bool:
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(self._executor, self._set_iso_sync, iso)
+        await STATE.broadcast("CAMERA_STATUS", self.status_dict())
+        return res
+
+    def _set_shutter_speed_sync(self, exposure_s: float) -> bool:
+        if exposure_s <= 30.0:
+            STATE.camera.shutter_speed = f"{exposure_s:g}s"
+            cands = (str(exposure_s), f"{exposure_s:g}", f"{exposure_s:.1f}", str(int(round(exposure_s))))
+            if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
+                return self._set_widget_sync("shutterspeed", cands)
+        else:
+            STATE.camera.shutter_speed = f"BULB ({exposure_s}s)"
+            if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
+                return self._set_widget_sync("shutterspeed", ("bulb", "Bulb"))
+        return True
+
+    async def set_shutter_speed(self, exposure_s: float) -> bool:
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(self._executor, self._set_shutter_speed_sync, exposure_s)
+        await STATE.broadcast("CAMERA_STATUS", self.status_dict())
+        return res
 
     def _set_image_format_sync(self, fast_jpeg: bool) -> str:
         """Switch camera between Small Fine JPEG (fast-solve loop) and RAW (.CR3)."""
@@ -458,7 +509,23 @@ class CameraController:
             output_path,
         )
 
+    def _drain_events_sync(self, max_wait_ms: int = 300) -> None:
+        if self._gp_camera is None or gp is None:
+            return
+        t_end = time.monotonic() + (max_wait_ms / 1000.0)
+        while time.monotonic() < t_end:
+            try:
+                ev_type, _ = self._gp_camera.wait_for_event(50, self._gp_context)
+                if ev_type == gp.GP_EVENT_TIMEOUT:
+                    break
+            except Exception:
+                break
+
     def _gphoto_standard_capture_sync(self, output_path: Path) -> None:
+        # Drain any lingering live view frames from the camera's USB FIFO buffer
+        self._drain_events_sync(max_wait_ms=300)
+
+        direct_exc = None
         try:
             file_path = self._gp_camera.capture(gp.GP_CAPTURE_IMAGE, self._gp_context)
             camera_file = self._gp_camera.file_get(
@@ -474,13 +541,16 @@ class CameraController:
             except Exception:
                 pass
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            direct_exc = exc
 
         # Event-driven wait fallback for Canon cameras (handles asynchronous PTP buffer flush)
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
-            ev_type, ev_data = self._gp_camera.wait_for_event(500, self._gp_context)
+            try:
+                ev_type, ev_data = self._gp_camera.wait_for_event(500, self._gp_context)
+            except Exception:
+                break
             if ev_type == gp.GP_EVENT_FILE_ADDED:
                 camera_file = self._gp_camera.file_get(
                     ev_data.folder,
@@ -495,6 +565,8 @@ class CameraController:
                 except Exception:
                     pass
                 return
+        if direct_exc is not None:
+            raise direct_exc
         raise TimeoutError("Timed out waiting for image capture from Canon EOS M200")
 
     def _gphoto_wait_file_added_sync(self, output_path: Path) -> None:
