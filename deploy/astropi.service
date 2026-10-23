@@ -13,7 +13,7 @@ Environment="ASTROPI_CAPTURES_DIR=/var/lib/astropi/captures"
 Environment="ASTROPI_SHM_DIR=/dev/shm/astropi"
 Environment="ASTROPI_ASTAP_DB=/opt/astap"
 ExecStartPre=/bin/mkdir -p /dev/shm/astropi /var/lib/astropi/captures
-ExecStart=/opt/astropi/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+ExecStart=/opt/astropi/venv/bin/python3 -m app.main
 Restart=always
 RestartSec=3
 Nice=-10

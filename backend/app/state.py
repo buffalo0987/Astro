@@ -18,14 +18,14 @@ from .db import DB
 
 @dataclass
 class ObserverState:
-    latitude_deg: float = 38.8951
-    longitude_deg: float = -77.0364
-    elevation_m: float = 320.0
+    latitude_deg: float = 35.3395
+    longitude_deg: float = -97.4867
+    elevation_m: float = 382.0
     pressure_hpa: float = 1010.0
     temperature_c: float = 10.0
     refraction_enabled: bool = True
     clock_offset_s: float = 0.0  # Client UTC - Pi UTC delta when Pi lacks NTP
-    sync_source: str = "Preset"  # "Browser GPS", "Preset", "Manual"
+    sync_source: str = "Preset: Moore, OK (Bortle 8)"  # "Browser GPS", "Preset", "Manual"
     last_synced_at: Optional[float] = None
 
     def current_utc_timestamp(self) -> float:

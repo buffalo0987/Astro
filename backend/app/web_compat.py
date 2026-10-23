@@ -320,7 +320,8 @@ async def dispatch_http_request(
 class SimpleTestResponse:
     def __init__(self, status_code: int, headers: Dict[str, str], content: bytes) -> None:
         self.status_code = status_code
-        self.headers = headers
+        self.headers = {k.lower(): v for k, v in headers.items()}
+        self.raw_headers = headers
         self.content = content
 
     @property

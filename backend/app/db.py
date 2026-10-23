@@ -140,20 +140,18 @@ class Database:
                 conn.close()
 
     def _seed_defaults(self, conn: sqlite3.Connection) -> None:
-        cur = conn.execute("SELECT COUNT(*) AS cnt FROM site_presets")
-        if cur.fetchone()["cnt"] == 0:
-            conn.executemany(
-                """
-                INSERT INTO site_presets (name, latitude_deg, longitude_deg, elevation_m, bortle_class, is_default)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    ("Dark Sky Field Site (Default)", 38.8951, -77.0364, 320.0, 3, 1),
-                    ("Backyard Observatory", 40.7128, -74.0060, 45.0, 6, 0),
-                    ("High Desert Star Party", 34.1184, -116.4197, 1280.0, 2, 0),
-                ],
-            )
-            conn.commit()
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO site_presets (name, latitude_deg, longitude_deg, elevation_m, bortle_class, is_default)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("Moore, OK — Backyard (Bortle 8)", 35.3395, -97.4867, 382.0, 8, 1),
+                ("Wichita Mountains Wildlife Refuge, OK (Bortle 3)", 34.7315, -98.7136, 510.0, 3, 0),
+                ("Black Mesa State Park, OK (Bortle 1)", 36.8439, -102.8810, 1300.0, 1, 0),
+            ],
+        )
+        conn.commit()
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

@@ -33,6 +33,7 @@ ENV/
 # AstroPi local database & session captures
 data/*.db*
 data/certs/*.key
+data/certs/*.crt
 data/captures/
 !frontend/dist/
 frontend/node_modules/

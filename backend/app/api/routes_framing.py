@@ -43,6 +43,7 @@ async def list_dso_catalog(
     search: str = "",
     object_type: str = "",
     min_alt: Optional[float] = None,
+    tpo180_only: bool = False,
 ) -> Dict[str, Any]:
     obs = _current_observer()
     items = query_catalog(
@@ -51,6 +52,7 @@ async def list_dso_catalog(
         search=search,
         object_type=object_type,
         min_altitude_deg=min_alt,
+        tpo180_only=tpo180_only,
     )
     return {"items": items, "count": len(items)}
 

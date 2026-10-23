@@ -264,6 +264,21 @@ class TestAstroPiSuite(unittest.TestCase):
         del_resp = self.client.delete(f"/api/sessions/{target_sess['id']}")
         self.assertEqual(del_resp.status_code, 200)
 
+    def test_06_system_endpoints_and_root_ca_export(self) -> None:
+        """Verify system status and downloadable Root CA profile for HTTPS / PWA."""
+        state_resp = self.client.get("/api/system/state")
+        self.assertEqual(state_resp.status_code, 200)
+        self.assertIn("system", state_resp.json())
+
+        storage_resp = self.client.get("/api/system/storage")
+        self.assertEqual(storage_resp.status_code, 200)
+        self.assertIn("active_storage_path", storage_resp.json())
+
+        ca_resp = self.client.get("/api/system/ca.crt")
+        self.assertEqual(ca_resp.status_code, 200)
+        self.assertIn(b"BEGIN CERTIFICATE", ca_resp.content)
+        self.assertEqual(ca_resp.headers.get("content-type"), "application/x-x509-ca-cert")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

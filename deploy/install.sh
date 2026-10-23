@@ -31,7 +31,7 @@ apt-get install -y --no-install-recommends \
   gphoto2 libgphoto2-dev libusb-1.0-0-dev \
   samba avahi-daemon avahi-utils \
   exfatprogs ntfs-3g udisks2 \
-  network-manager curl ca-certificates unzip
+  network-manager curl ca-certificates unzip git rsync
 
 echo "[2/7] Masking OS gvfs PTP auto-mounters and installing Canon EOS M200 udev rule..."
 systemctl --global mask gvfs-gphoto2-volume-monitor.service 2>/dev/null || true

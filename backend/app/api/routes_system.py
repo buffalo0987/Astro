@@ -6,7 +6,7 @@ import datetime as dt
 import ipaddress
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from ..config import CONFIG
 from ..db import DB
@@ -17,40 +17,91 @@ from ..web_compat import APIRouter, HTTPException, Response
 router = APIRouter(prefix="/api/system", tags=["system"])
 
 
-def ensure_local_root_ca() -> Path:
-    """Generate a self-hosted Root CA + server certificate for https://astro.local & 10.42.0.1."""
+def ensure_local_root_ca() -> Tuple[Path, Path, Path]:
+    """Generate a self-hosted Root CA + TLS server certificate for https://astro.local & 10.42.0.1."""
     ca_cert_path = CONFIG.certs_dir / "astropi-root-ca.crt"
     ca_key_path = CONFIG.certs_dir / "astropi-root-ca.key"
-    if ca_cert_path.is_file() and ca_key_path.is_file():
-        return ca_cert_path
+    srv_cert_path = CONFIG.certs_dir / "server.crt"
+    srv_key_path = CONFIG.certs_dir / "server.key"
+
+    if (
+        ca_cert_path.is_file()
+        and ca_key_path.is_file()
+        and srv_cert_path.is_file()
+        and srv_key_path.is_file()
+    ):
+        return ca_cert_path, srv_cert_path, srv_key_path
 
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name(
+    CONFIG.certs_dir.mkdir(parents=True, exist_ok=True)
+    now = dt.datetime.now(dt.timezone.utc)
+
+    # 1. Generate Root CA
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_subject = x509.Name(
         [
             x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "AstroPi Field Observatory"),
-            x509.NameAttribute(NameOID.COMMON_NAME, "AstroPi Field Local Root CA"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "AstroPi Field Root CA"),
         ]
     )
-    now = dt.datetime.now(dt.timezone.utc)
-    cert = (
+    ca_cert = (
         x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
+        .subject_name(ca_subject)
+        .issuer_name(ca_subject)
+        .public_key(ca_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - dt.timedelta(days=1))
         .not_valid_after(now + dt.timedelta(days=3650))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    ca_key_path.write_bytes(
+        ca_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    ca_cert_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+
+    # 2. Generate Server Certificate signed by Root CA (iOS 13+ compliant <= 825 days validity)
+    srv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    srv_subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "astro.local")])
+    srv_cert = (
+        x509.CertificateBuilder()
+        .subject_name(srv_subject)
+        .issuer_name(ca_subject)
+        .public_key(srv_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(days=1))
+        .not_valid_after(now + dt.timedelta(days=820))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(
             x509.SubjectAlternativeName(
                 [
                     x509.DNSName("astro.local"),
+                    x509.DNSName("astro"),
                     x509.DNSName("localhost"),
                     x509.IPAddress(ipaddress.IPv4Address("10.42.0.1")),
                     x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
@@ -58,18 +109,19 @@ def ensure_local_root_ca() -> Path:
             ),
             critical=False,
         )
-        .sign(key, hashes.SHA256())
+        .sign(ca_key, hashes.SHA256())
     )
-    CONFIG.certs_dir.mkdir(parents=True, exist_ok=True)
-    ca_key_path.write_bytes(
-        key.private_bytes(
+
+    srv_key_path.write_bytes(
+        srv_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.TraditionalOpenSSL,
             encryption_algorithm=serialization.NoEncryption(),
         )
     )
-    ca_cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    return ca_cert_path
+    srv_cert_path.write_bytes(srv_cert.public_bytes(serialization.Encoding.PEM))
+
+    return ca_cert_path, srv_cert_path, srv_key_path
 
 
 @router.get("/state")
@@ -156,9 +208,9 @@ async def eject_usb_storage(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
 @router.get("/ca.crt")
 async def download_local_root_ca() -> Response:
-    cert_path = ensure_local_root_ca()
+    ca_cert_path, _, _ = ensure_local_root_ca()
     return Response(
-        content=cert_path.read_bytes(),
+        content=ca_cert_path.read_bytes(),
         media_type="application/x-x509-ca-cert",
         headers={
             "Content-Disposition": 'attachment; filename="AstroPi-Local-Root-CA.crt"',

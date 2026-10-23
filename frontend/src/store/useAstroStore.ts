@@ -166,6 +166,14 @@ export const useAstroStore = create<AstroStore>((set, get) => ({
   setDrawerOpen: (open) => set({ drawerOpen: open }),
 
   fetchInitialState: async () => {
+    fetch('/api/system/location-time', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_utc_timestamp: Date.now() / 1000,
+        sync_source: 'Auto Clock Sync',
+      }),
+    }).catch(() => {});
     const res = await fetch('/api/system/state');
     if (res.ok) {
       const data = await res.json();

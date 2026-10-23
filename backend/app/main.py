@@ -90,13 +90,38 @@ if CONFIG.frontend_dist_dir.exists():
     app.mount("/", StaticFiles(directory=str(CONFIG.frontend_dist_dir), html=True), name="frontend")
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
-    """Start the single-worker headless server via Uvicorn (or Tornado fallback)."""
+def run_server(host: str = "0.0.0.0", port: int = 8000, ssl_port: int = 8443) -> None:
+    """Start the single-worker headless server with dual HTTP (8000) and HTTPS Secure Context (8443)."""
     if HAS_NATIVE_FASTAPI:
         import uvicorn  # type: ignore
-        uvicorn.run(app, host=host, port=port, workers=1, log_level="info")
+        _, srv_cert, srv_key = routes_system.ensure_local_root_ca()
+
+        async def _run_dual() -> None:
+            c_http = uvicorn.Config(app, host=host, port=port, log_level="info")
+            s_http = uvicorn.Server(c_http)
+            if srv_cert.is_file() and srv_key.is_file():
+                c_https = uvicorn.Config(
+                    app,
+                    host=host,
+                    port=ssl_port,
+                    ssl_certfile=str(srv_cert),
+                    ssl_keyfile=str(srv_key),
+                    log_level="info",
+                )
+                s_https = uvicorn.Server(c_https)
+                print(f"AstroPi HTTP Server listening on http://{host}:{port}")
+                print(f"AstroPi HTTPS (Secure Context / PWA) listening on https://{host}:{ssl_port}")
+                await asyncio.gather(s_http.serve(), s_https.serve())
+            else:
+                await s_http.serve()
+
+        try:
+            asyncio.run(_run_dual())
+        except (KeyboardInterrupt, SystemExit):
+            pass
         return
 
+    import ssl
     import tornado.ioloop
     import tornado.web
     import tornado.websocket
@@ -166,7 +191,18 @@ def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
             ]
         )
         t_app.listen(port, address=host)
-        print(f"AstroPi Headless Server listening on http://{host}:{port}")
+        print(f"AstroPi HTTP Server listening on http://{host}:{port}")
+
+        _, srv_cert, srv_key = routes_system.ensure_local_root_ca()
+        if srv_cert.is_file() and srv_key.is_file():
+            try:
+                ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                ssl_ctx.load_cert_chain(certfile=str(srv_cert), keyfile=str(srv_key))
+                t_app.listen(ssl_port, address=host, ssl_options=ssl_ctx)
+                print(f"AstroPi HTTPS (Secure Context / PWA) listening on https://{host}:{ssl_port}")
+            except Exception as exc:
+                print(f"HTTPS listener setup warning: {exc}")
+
         await asyncio.Event().wait()
 
     try:
