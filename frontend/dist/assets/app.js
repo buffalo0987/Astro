@@ -32,6 +32,8 @@
     abortArmed: false,
     wsConnected: false,
     zoom: 1.0,
+    panX: 0.5,
+    panY: 0.5,
     liveLoopRunning: false,
     catalogLoading: false,
     manualExposure: '2',
@@ -71,6 +73,19 @@
       throw new Error(err.detail || 'Request failed');
     }
     return res.json();
+  }
+
+  function computeLst(utcSec, lonDeg) {
+    const jd = utcSec / 86400.0 + 2440587.5;
+    const d = jd - 2451545.0;
+    const tCent = d / 36525.0;
+    let gmst = (280.46061837 + 360.98564736629 * d + 0.000387933 * tCent * tCent) % 360.0;
+    if (gmst < 0) gmst += 360.0;
+    let lst = ((gmst + (lonDeg || 0)) % 360.0 + 360.0) % 360.0 / 15.0;
+    const h = Math.floor(lst);
+    const m = Math.floor((lst - h) * 60);
+    const s = Math.floor(((lst - h) * 60 - m) * 60);
+    return `${String(h).padStart(2, '0')}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
   }
 
   function formatDuration(totalSec) {
@@ -251,14 +266,29 @@
     img.onload = () => {
       ctx.save();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const imgW = img.naturalWidth || canvas.width;
+      const imgH = img.naturalHeight || canvas.height;
+
+      let cropX = 0;
+      let cropY = 0;
+      let cropW = imgW;
+      let cropH = imgH;
+
       if (store.zoom > 1.0) {
-        const zw = canvas.width / store.zoom;
-        const zh = canvas.height / store.zoom;
-        const sx = (canvas.width - zw) / 2;
-        const sy = (canvas.height - zh) / 2;
-        ctx.drawImage(img, sx, sy, zw, zh, 0, 0, canvas.width, canvas.height);
+        cropW = imgW / store.zoom;
+        cropH = imgH / store.zoom;
+        const hw = cropW / 2;
+        const hh = cropH / 2;
+
+        const centerX = Math.max(hw, Math.min(imgW - hw, store.panX * imgW));
+        const centerY = Math.max(hh, Math.min(imgH - hh, store.panY * imgH));
+
+        cropX = centerX - hw;
+        cropY = centerY - hh;
+
+        ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
       } else {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, imgW, imgH, 0, 0, canvas.width, canvas.height);
       }
       ctx.restore();
 
@@ -274,21 +304,151 @@
         ctx.putImageData(idata, 0, 0);
       }
 
+      // Draw star overlays mapped into current zoom & pan window
       const stars = preview.stars_overlay || [];
       ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#22d3ee';
       ctx.fillStyle = store.nightVision ? '#ff1a1a' : '#22d3ee';
       ctx.lineWidth = 1.5;
       ctx.font = '12px monospace';
       for (const s of stars) {
-        const sx = s.x * canvas.width;
-        const sy = s.y * canvas.height;
+        let destX, destY;
+        if (store.zoom > 1.0) {
+          const starImgX = s.x * imgW;
+          const starImgY = s.y * imgH;
+          if (starImgX < cropX || starImgX > cropX + cropW || starImgY < cropY || starImgY > cropY + cropH) {
+            continue;
+          }
+          destX = ((starImgX - cropX) / cropW) * canvas.width;
+          destY = ((starImgY - cropY) / cropH) * canvas.height;
+        } else {
+          destX = s.x * canvas.width;
+          destY = s.y * canvas.height;
+        }
         ctx.beginPath();
-        ctx.arc(sx, sy, Math.max(6, s.hfr * 3), 0, Math.PI * 2);
+        ctx.arc(destX, destY, Math.max(6, s.hfr * 3 * store.zoom), 0, Math.PI * 2);
         ctx.stroke();
-        ctx.fillText(`${s.hfr.toFixed(1)}px`, sx + 8, sy - 6);
+        ctx.fillText(`${s.hfr.toFixed(1)}px`, destX + 8, destY - 6);
+      }
+
+      // If zoomed, draw pan hint and overview mini-map
+      if (store.zoom > 1.0) {
+        // Top-left hint pill
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(8, 8, 175, 26);
+        ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#27272a';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(8, 8, 175, 26);
+        ctx.fillStyle = store.nightVision ? '#ff1a1a' : '#38bdf8';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(`🔍 ${store.zoom}x Zoom • Drag to Pan`, 14, 25);
+
+        // Top-right sensor mini-map
+        const mmW = 60;
+        const mmH = 40;
+        const mmX = canvas.width - mmW - 10;
+        const mmY = 10;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+        ctx.fillRect(mmX, mmY, mmW, mmH);
+        ctx.strokeStyle = store.nightVision ? '#550000' : 'rgba(255, 255, 255, 0.35)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(mmX, mmY, mmW, mmH);
+
+        // Viewport bounding box inside mini-map
+        const vpW = mmW / store.zoom;
+        const vpH = mmH / store.zoom;
+        const vpX = mmX + (cropX / imgW) * mmW;
+        const vpY = mmY + (cropY / imgH) * mmH;
+        ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#ef4444';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(vpX, vpY, vpW, vpH);
       }
     };
     img.src = preview.image_url;
+    initCanvasPan();
+  }
+
+  let isDraggingCanvas = false;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let dragStartPanX = 0.5;
+  let dragStartPanY = 0.5;
+
+  function initCanvasPan() {
+    const canvas = document.getElementById('sky-canvas');
+    if (!canvas || canvas._panAttached) {
+      if (canvas) canvas.style.cursor = store.zoom > 1.0 ? 'grab' : 'default';
+      return;
+    }
+    canvas._panAttached = true;
+    canvas.style.cursor = store.zoom > 1.0 ? 'grab' : 'default';
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (store.zoom <= 1.0) return;
+      isDraggingCanvas = true;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      dragStartPanX = store.panX;
+      dragStartPanY = store.panY;
+      canvas.style.cursor = 'grabbing';
+      e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isDraggingCanvas || store.zoom <= 1.0) return;
+      const rect = canvas.getBoundingClientRect();
+      const dx = (e.clientX - dragStartX) / rect.width;
+      const dy = (e.clientY - dragStartY) / rect.height;
+
+      const hw = 0.5 / store.zoom;
+      const hh = 0.5 / store.zoom;
+      store.panX = Math.max(hw, Math.min(1.0 - hw, dragStartPanX - dx / store.zoom));
+      store.panY = Math.max(hh, Math.min(1.0 - hh, dragStartPanY - dy / store.zoom));
+      renderPreviewCanvas();
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (isDraggingCanvas) {
+        isDraggingCanvas = false;
+        if (canvas) canvas.style.cursor = store.zoom > 1.0 ? 'grab' : 'default';
+      }
+    });
+
+    canvas.addEventListener('touchstart', (e) => {
+      if (store.zoom <= 1.0 || e.touches.length !== 1) return;
+      isDraggingCanvas = true;
+      dragStartX = e.touches[0].clientX;
+      dragStartY = e.touches[0].clientY;
+      dragStartPanX = store.panX;
+      dragStartPanY = store.panY;
+      e.preventDefault();
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', (e) => {
+      if (!isDraggingCanvas || store.zoom <= 1.0 || e.touches.length !== 1) return;
+      const rect = canvas.getBoundingClientRect();
+      const dx = (e.touches[0].clientX - dragStartX) / rect.width;
+      const dy = (e.touches[0].clientY - dragStartY) / rect.height;
+
+      const hw = 0.5 / store.zoom;
+      const hh = 0.5 / store.zoom;
+      store.panX = Math.max(hw, Math.min(1.0 - hw, dragStartPanX - dx / store.zoom));
+      store.panY = Math.max(hh, Math.min(1.0 - hh, dragStartPanY - dy / store.zoom));
+      renderPreviewCanvas();
+      e.preventDefault();
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', () => {
+      isDraggingCanvas = false;
+    });
+
+    canvas.addEventListener('dblclick', () => {
+      if (store.zoom > 1.0) {
+        store.panX = 0.5;
+        store.panY = 0.5;
+        renderPreviewCanvas();
+      }
+    });
   }
 
   function renderHistogramSvg(hist) {
@@ -972,12 +1132,57 @@
       )
       .join('');
 
+    const nowSec = (store.state?.observer?.clock_offset_s !== undefined)
+      ? (Date.now() / 1000 + (store.state.observer.clock_offset_s || 0))
+      : (Date.now() / 1000);
+    const dNow = new Date(nowSec * 1000);
+    const liveUtcStr = dNow.toISOString().substring(11, 19);
+    const liveLocalStr = dNow.toLocaleTimeString([], { hour12: false });
+    const liveLstStr = computeLst(nowSec, observer.longitude_deg);
+    const isClockSynced = observer.last_synced_at !== null && observer.last_synced_at !== undefined;
+
     return `
       <div class="modal-backdrop" id="drawer-backdrop">
         <div class="modal-drawer">
           <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border-col);padding-bottom:10px">
             <h3 style="font-size:16px">Observing Site, Clock &amp; Hardware</h3>
             <button class="btn btn-sm" data-action="close-drawer">✕ Close</button>
+          </div>
+
+          <!-- Observatory Clock & Sync Status -->
+          <div class="kpi-box" style="text-align:left;display:grid;gap:8px;background:var(--bg-oled);border:1px solid var(--border-col);padding:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div class="kpi-label">OBSERVATORY CLOCK &amp; TIME SYNCHRONIZATION</div>
+              <span class="badge ${isClockSynced ? 'badge-raw' : 'badge-warn'}" style="${isClockSynced ? 'background:#0e4429;border-color:#3fb950;color:#3fb950;font-weight:700' : ''}">
+                ${isClockSynced ? '🟢 CLOCK SYNCED' : '⚠️ SYNC RECOMMENDED'}
+              </span>
+            </div>
+            <div class="kpi-grid" style="grid-template-columns:repeat(3, 1fr);gap:6px">
+              <div style="background:var(--bg-card);padding:8px;border-radius:6px;border:1px solid var(--border-col)">
+                <div style="font-size:10px;color:var(--text-muted);font-weight:700">PI UTC CLOCK</div>
+                <div style="font-size:13px;font-weight:800;font-family:monospace;color:var(--text-main);margin-top:2px" id="drawer-utc-clock">${liveUtcStr} UTC</div>
+                <div style="font-size:10px;color:var(--text-muted)">Universal Time</div>
+              </div>
+              <div style="background:var(--bg-card);padding:8px;border-radius:6px;border:1px solid var(--border-col)">
+                <div style="font-size:10px;color:var(--text-muted);font-weight:700">LOCAL TIME</div>
+                <div style="font-size:13px;font-weight:800;font-family:monospace;color:var(--text-main);margin-top:2px" id="drawer-local-clock">${liveLocalStr}</div>
+                <div style="font-size:10px;color:var(--text-muted)">Device Local</div>
+              </div>
+              <div style="background:var(--bg-card);padding:8px;border-radius:6px;border:1px solid var(--border-col)">
+                <div style="font-size:10px;color:var(--text-muted);font-weight:700">SIDEREAL (LST)</div>
+                <div style="font-size:13px;font-weight:800;font-family:monospace;color:var(--accent);margin-top:2px" id="drawer-lst-clock">${liveLstStr}</div>
+                <div style="font-size:10px;color:var(--text-muted)">Meridian RA</div>
+              </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--text-muted);flex-wrap:wrap;gap:6px">
+              <div>
+                Sync Source: <strong style="color:var(--text-main)">${observer.sync_source || 'Browser Clock'}</strong>
+                ${observer.clock_offset_s !== undefined ? ` (Delta: ${observer.clock_offset_s > 0 ? '+' : ''}${Number(observer.clock_offset_s).toFixed(2)}s)` : ''}
+              </div>
+              <button class="btn btn-sm btn-primary" data-action="sync-gps" style="padding:4px 10px">
+                ⚡ Sync Clock &amp; GPS Now
+              </button>
+            </div>
           </div>
 
           <div style="display:grid;gap:8px">
@@ -1081,6 +1286,10 @@
             </span>
           </div>
           <div style="display:flex;gap:6px;align-items:center">
+            <button class="btn btn-sm" data-action="open-drawer" title="Observatory Clock: ${observer.last_synced_at ? 'Synced' : 'Tap to sync'}. Tap to view clock &amp; site settings" style="display:inline-flex;align-items:center;gap:5px;font-family:monospace;font-size:12px;padding:3px 8px">
+              <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${observer.last_synced_at ? '#10b981' : '#f59e0b'}"></span>
+              <span id="hud-clock-time">${new Date(((store.state?.observer?.clock_offset_s !== undefined) ? (Date.now()/1000 + (store.state.observer.clock_offset_s||0)) : Date.now()/1000) * 1000).toISOString().substring(11, 19)} UTC</span>
+            </button>
             <button class="btn btn-sm" data-action="open-drawer">
               📍 Site (${observer.latitude_deg.toFixed(1)}°, ${observer.longitude_deg.toFixed(1)}°)
             </button>
@@ -1131,9 +1340,10 @@
               <button class="btn btn-sm ${store.liveLoopRunning ? 'btn-warn' : ''}" data-action="toggle-live-loop" title="Stream live viewfinder from sensor without physical shutter">
                 ${store.liveLoopRunning ? '⏹ Stop Live View' : '▶ Live Viewfinder'}
               </button>
-              <button class="btn btn-sm ${store.zoom > 1 ? 'btn-active' : ''}" data-action="toggle-zoom">
-                🔍 ${store.zoom > 1 ? '2x Zoom' : '1x Fit'}
+              <button class="btn btn-sm ${store.zoom > 1 ? 'btn-active' : ''}" data-action="toggle-zoom" title="Cycle 1x Fit / 2x Zoom / 4x Zoom">
+                🔍 ${store.zoom > 1 ? `${store.zoom}x Zoom` : '1x Fit'}
               </button>
+              ${store.zoom > 1 ? `<button class="btn btn-sm" data-action="reset-pan" title="Center pan on image">🎯 Center</button>` : ''}
               <button class="btn btn-sm btn-primary" data-action="manual-shot">📸 Test Shot</button>
             </div>
           </div>
@@ -1319,9 +1529,21 @@
       document.documentElement.classList.toggle('night-vision', store.nightVision);
       render();
     } else if (act === 'toggle-zoom') {
-      store.zoom = store.zoom > 1.0 ? 1.0 : 2.0;
-      renderPreviewCanvas();
+      if (store.zoom === 1.0) {
+        store.zoom = 2.0;
+      } else if (store.zoom === 2.0) {
+        store.zoom = 4.0;
+      } else {
+        store.zoom = 1.0;
+        store.panX = 0.5;
+        store.panY = 0.5;
+      }
       render();
+      renderPreviewCanvas();
+    } else if (act === 'reset-pan') {
+      store.panX = 0.5;
+      store.panY = 0.5;
+      renderPreviewCanvas();
     } else if (act === 'open-drawer') {
       store.drawerOpen = true;
       const pr = await api('/api/system/presets');
@@ -1362,11 +1584,30 @@
       store.presets = pr.presets || [];
       await refreshAll();
     } else if (act === 'sync-gps') {
-      await api('/api/system/location-time', 'PUT', {
-        client_utc_timestamp: Date.now() / 1000,
-        sync_source: 'Phone Clock Sync',
-      });
-      await refreshAll();
+      const doSync = async (coords = null) => {
+        const payload = {
+          client_utc_timestamp: Date.now() / 1000,
+          sync_source: coords ? 'Browser GPS & Clock' : 'Browser Device Clock',
+        };
+        if (coords) {
+          payload.latitude_deg = coords.latitude;
+          payload.longitude_deg = coords.longitude;
+          if (coords.altitude) payload.elevation_m = coords.altitude;
+        }
+        await api('/api/system/location-time', 'PUT', payload);
+        await refreshAll();
+        loadCatalog().catch(() => {});
+      };
+
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => doSync(pos.coords),
+          () => doSync(null),
+          { timeout: 6000 }
+        );
+      } else {
+        await doSync(null);
+      }
     } else if (act === 'connect-camera') {
       try {
         const res = await api('/api/camera/connect', 'POST');
@@ -1623,4 +1864,27 @@
   loadCatalog().catch(() => {});
   refreshAll().catch(() => {});
   connectWs();
+
+  // Keep HUD and drawer clocks ticking live every 1 second
+  setInterval(() => {
+    const nowSec = (store.state?.observer?.clock_offset_s !== undefined)
+      ? (Date.now() / 1000 + (store.state.observer.clock_offset_s || 0))
+      : (Date.now() / 1000);
+    const d = new Date(nowSec * 1000);
+    const utcStr = d.toISOString().substring(11, 19);
+
+    const hudEl = document.getElementById('hud-clock-time');
+    if (hudEl) hudEl.textContent = `${utcStr} UTC`;
+
+    const dUtc = document.getElementById('drawer-utc-clock');
+    if (dUtc) dUtc.textContent = `${utcStr} UTC`;
+
+    const dLoc = document.getElementById('drawer-local-clock');
+    if (dLoc) dLoc.textContent = d.toLocaleTimeString([], { hour12: false });
+
+    const dLst = document.getElementById('drawer-lst-clock');
+    if (dLst && store.state?.observer?.longitude_deg !== undefined) {
+      dLst.textContent = computeLst(nowSec, store.state.observer.longitude_deg);
+    }
+  }, 1000);
 })();
