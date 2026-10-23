@@ -192,8 +192,20 @@
 
   function renderPreviewCanvas() {
     const canvas = document.getElementById('sky-canvas');
+    if (!canvas) return;
     const preview = store.state?.preview;
-    if (!canvas || !preview?.image_url) return;
+    if (!preview?.image_url) {
+      canvas.width = 960;
+      canvas.height = 540;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#0a0a0c';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = store.nightVision ? '#ff1a1a' : '#a1a1aa';
+      ctx.font = '14px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText("Tap '▶ Live Viewfinder' or '📸 Test Shot' to see camera view", canvas.width / 2, canvas.height / 2);
+      return;
+    }
     const img = new Image();
     img.onload = () => {
       canvas.width = img.width || 960;
@@ -1011,8 +1023,8 @@
               <span style="font-size:11px;color:var(--text-muted);margin-left:6px">(${preview?.source_format || 'RAW .CR3'})</span>
             </div>
             <div style="display:flex;gap:6px;align-items:center">
-              <button class="btn btn-sm ${store.liveLoopRunning ? 'btn-warn' : ''}" data-action="toggle-live-loop" title="Continuously capture 1.5s preview frames">
-                ${store.liveLoopRunning ? '⏹ Stop Live Loop' : '▶ Live View Loop'}
+              <button class="btn btn-sm ${store.liveLoopRunning ? 'btn-warn' : ''}" data-action="toggle-live-loop" title="Stream live viewfinder from sensor without physical shutter">
+                ${store.liveLoopRunning ? '⏹ Stop Live View' : '▶ Live Viewfinder'}
               </button>
               <button class="btn btn-sm ${store.zoom > 1 ? 'btn-active' : ''}" data-action="toggle-zoom">
                 🔍 ${store.zoom > 1 ? '2x Zoom' : '1x Fit'}
@@ -1207,7 +1219,11 @@
       await api('/api/camera/reset-usb', 'POST');
       await refreshAll();
     } else if (act === 'manual-shot') {
-      await api('/api/camera/capture', 'POST', { exposure_s: 1.5, iso: '800', fast_jpeg: true });
+      try {
+        await api('/api/camera/capture', 'POST', { exposure_s: 1.5, iso: '800', fast_jpeg: true });
+      } catch (err) {
+        alert('Camera capture error: ' + err.message);
+      }
       await refreshAll();
     } else if (act === 'pa-mode-3') {
       await api('/api/pa/start', 'POST', { mode_points: 3 });

@@ -6,6 +6,7 @@ import asyncio
 import time
 from typing import Any, Dict, Optional
 
+import numpy as np
 from PIL import Image
 
 from ..config import CONFIG
@@ -22,23 +23,54 @@ _preview_loop_task: Optional[asyncio.Task[None]] = None
 _preview_loop_stop = asyncio.Event()
 
 
-async def _preview_loop_worker(exposure_s: float, iso: str) -> None:
+async def _preview_loop_worker() -> None:
+    live_path = CONFIG.shm_dir / "live_view.jpg"
+    preview_path = CONFIG.shm_dir / "latest_preview.jpg"
     try:
         while not _preview_loop_stop.is_set():
-            await capture_manual_preview(
-                {
-                    "exposure_s": exposure_s,
-                    "iso": iso,
-                    "fast_jpeg": True,
-                    "auto_stretch": True,
-                    "restore_raw_after": False,
-                }
-            )
-            await asyncio.sleep(0.40)
+            t0 = time.monotonic()
+            await CAMERA.capture_live_view(live_path)
+
+            if not live_path.is_file() or live_path.stat().st_size == 0:
+                await asyncio.sleep(0.15)
+                continue
+
+            try:
+                with Image.open(live_path) as img:
+                    arr_rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
+
+                stretched = auto_stretch_rgb(arr_rgb, enable_stretch=True)
+                hist = compute_histogram_256(stretched)
+                Image.fromarray(stretched).save(preview_path, format="JPEG", quality=82)
+
+                ts_ms = int(time.time() * 1000)
+                fps = round(1.0 / max(0.01, time.monotonic() - t0), 1)
+                STATE.latest_preview.update(
+                    {
+                        "image_url": f"/api/camera/preview.jpg?t={ts_ms}",
+                        "timestamp": time.time(),
+                        "width": int(stretched.shape[1]),
+                        "height": int(stretched.shape[0]),
+                        "source_format": "Live Viewfinder",
+                        "auto_stretched": True,
+                        "histogram": hist,
+                        "stars_overlay": [],
+                        "meta": {
+                            "mode": "Live Viewfinder",
+                            "fps": fps,
+                        },
+                    }
+                )
+                await STATE.broadcast("PREVIEW_UPDATED", STATE.latest_preview)
+            except Exception:
+                pass
+            await asyncio.sleep(0.12)
     except asyncio.CancelledError:
         pass
+    except Exception as exc:
+        STATE.camera.last_error = f"Live view error: {exc}"
+        await STATE.broadcast("CAMERA_STATUS", CAMERA.status_dict())
     finally:
-        await CAMERA.ensure_raw_format()
         STATE.camera.busy = False
         await STATE.broadcast("CAMERA_STATUS", CAMERA.status_dict())
 
@@ -46,13 +78,10 @@ async def _preview_loop_worker(exposure_s: float, iso: str) -> None:
 @router.post("/live-loop/start")
 async def start_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     global _preview_loop_task
-    body = payload or {}
-    exposure_s = float(body.get("exposure_s", 1.5))
-    iso = str(body.get("iso", "800"))
     if _preview_loop_task is not None and not _preview_loop_task.done():
         return {"running": True, "camera": CAMERA.status_dict()}
     _preview_loop_stop.clear()
-    _preview_loop_task = asyncio.create_task(_preview_loop_worker(exposure_s, iso))
+    _preview_loop_task = asyncio.create_task(_preview_loop_worker())
     return {"running": True, "camera": CAMERA.status_dict()}
 
 
@@ -67,7 +96,6 @@ async def stop_live_loop() -> Dict[str, Any]:
         except (asyncio.CancelledError, Exception):
             pass
     _preview_loop_task = None
-    await CAMERA.ensure_raw_format()
     return {"running": False, "camera": CAMERA.status_dict()}
 
 
@@ -127,6 +155,7 @@ async def capture_manual_preview(payload: Dict[str, Any] = None) -> Dict[str, An
             fast_jpeg=fast_jpeg,
             frame_type="Light",
             mode=STATE.active_mode,
+            max_retries=1,
         )
         arr_rgb, decoded_from = decode_cr3_preview_array(out_file, max_dim=1500, tier2_linear=tier2_linear)
         stretched = auto_stretch_rgb(arr_rgb, enable_stretch=enable_stretch)

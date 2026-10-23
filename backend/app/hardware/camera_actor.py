@@ -240,7 +240,7 @@ class CameraController:
         frame_type: str = "Light",
         mode: str = "IDLE",
         keep_on_camera_sd: bool = False,
-        max_retries: int = 3,
+        max_retries: int = 1,
     ) -> Path:
         """Execute a thread-safe camera exposure (<=30s native or >30s Bulb) with USB auto-retry."""
         async with self._capture_lock:
@@ -416,16 +416,86 @@ class CameraController:
             STATE.observer.current_utc_timestamp(),
         )
 
-    def _gphoto_standard_capture_sync(self, output_path: Path) -> None:
-        file_path = self._gp_camera.capture(gp.GP_CAPTURE_IMAGE, self._gp_context)
-        camera_file = self._gp_camera.file_get(
-            file_path.folder,
-            file_path.name,
-            gp.GP_FILE_TYPE_NORMAL,
-            self._gp_context,
+    def capture_preview_frame_sync(self, output_path: Path) -> Path:
+        """Capture an instant viewfinder frame directly from Canon live-view stream without actuating the physical shutter."""
+        if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None and gp is not None:
+            try:
+                camera_file = self._gp_camera.capture_preview(self._gp_context)
+            except TypeError:
+                camera_file = self._gp_camera.capture_preview()
+            file_data = camera_file.get_data_and_size()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(bytes(file_data))
+            return output_path
+
+        # Simulator fallback: render synthetic frame fast
+        obs = ObserverLocation(
+            latitude_deg=STATE.observer.latitude_deg,
+            longitude_deg=STATE.observer.longitude_deg,
+            elevation_m=STATE.observer.elevation_m,
+            pressure_hpa=STATE.observer.pressure_hpa,
+            temperature_c=STATE.observer.temperature_c,
+            refraction_enabled=STATE.observer.refraction_enabled,
         )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        camera_file.save(str(output_path))
+        SIM_RIG.render_synthetic_frame(
+            output_path,
+            is_raw=False,
+            frame_type="Light",
+            exposure_s=0.1,
+            iso="800",
+            mode=STATE.active_mode,
+            observer=obs,
+            utc_timestamp=STATE.observer.current_utc_timestamp(),
+        )
+        return output_path
+
+    async def capture_live_view(self, output_path: Path) -> Path:
+        """Asynchronously stream a live viewfinder frame without tripping the shutter."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self.capture_preview_frame_sync,
+            output_path,
+        )
+
+    def _gphoto_standard_capture_sync(self, output_path: Path) -> None:
+        try:
+            file_path = self._gp_camera.capture(gp.GP_CAPTURE_IMAGE, self._gp_context)
+            camera_file = self._gp_camera.file_get(
+                file_path.folder,
+                file_path.name,
+                gp.GP_FILE_TYPE_NORMAL,
+                self._gp_context,
+            )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            camera_file.save(str(output_path))
+            try:
+                self._gp_camera.file_delete(file_path.folder, file_path.name, self._gp_context)
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+
+        # Event-driven wait fallback for Canon cameras (handles asynchronous PTP buffer flush)
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            ev_type, ev_data = self._gp_camera.wait_for_event(500, self._gp_context)
+            if ev_type == gp.GP_EVENT_FILE_ADDED:
+                camera_file = self._gp_camera.file_get(
+                    ev_data.folder,
+                    ev_data.name,
+                    gp.GP_FILE_TYPE_NORMAL,
+                    self._gp_context,
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                camera_file.save(str(output_path))
+                try:
+                    self._gp_camera.file_delete(ev_data.folder, ev_data.name, self._gp_context)
+                except Exception:
+                    pass
+                return
+        raise TimeoutError("Timed out waiting for image capture from Canon EOS M200")
 
     def _gphoto_wait_file_added_sync(self, output_path: Path) -> None:
         deadline = time.monotonic() + 15.0
@@ -440,6 +510,10 @@ class CameraController:
                 )
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 camera_file.save(str(output_path))
+                try:
+                    self._gp_camera.file_delete(ev_data.folder, ev_data.name, self._gp_context)
+                except Exception:
+                    pass
                 return
         raise TimeoutError("Timed out waiting for GP_EVENT_FILE_ADDED after Bulb release")
 
