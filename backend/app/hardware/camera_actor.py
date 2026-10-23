@@ -117,7 +117,10 @@ class CameraController:
         if self._gp_camera is None or gp is None:
             return
         try:
-            cfg = self._gp_camera.get_config(self._gp_context)
+            try:
+                cfg = self._gp_camera.get_config()
+            except Exception:
+                cfg = self._gp_camera.get_config(self._gp_context)
             ok, widget = gp.gp_widget_get_child_by_name(cfg, "imageformat")
             if ok >= gp.GP_OK:
                 choices = [widget.get_choice(i) for i in range(widget.count_choices())]
@@ -138,7 +141,10 @@ class CameraController:
         if self._gp_camera is None or gp is None:
             return False
         try:
-            cfg = self._gp_camera.get_config(self._gp_context)
+            try:
+                cfg = self._gp_camera.get_config()
+            except Exception:
+                cfg = self._gp_camera.get_config(self._gp_context)
             ok, widget = gp.gp_widget_get_child_by_name(cfg, widget_name)
             if ok < gp.GP_OK:
                 return False
@@ -149,24 +155,30 @@ class CameraController:
             except Exception:
                 pass
 
+            def _apply_cfg(c: Any) -> None:
+                try:
+                    self._gp_camera.set_config(c)
+                except Exception:
+                    self._gp_camera.set_config(c, self._gp_context)
+
             if choices:
                 for cand in candidates:
                     for ch in choices:
                         if cand.lower() == ch.lower() or cand == ch:
                             widget.set_value(ch)
-                            self._gp_camera.set_config(cfg, self._gp_context)
+                            _apply_cfg(cfg)
                             return True
                 for cand in candidates:
                     for ch in choices:
                         if cand in ch:
                             widget.set_value(ch)
-                            self._gp_camera.set_config(cfg, self._gp_context)
+                            _apply_cfg(cfg)
                             return True
             else:
                 for val in candidates:
                     try:
                         widget.set_value(val)
-                        self._gp_camera.set_config(cfg, self._gp_context)
+                        _apply_cfg(cfg)
                         return True
                     except Exception:
                         continue
@@ -471,9 +483,9 @@ class CameraController:
         """Capture an instant viewfinder frame directly from Canon live-view stream without actuating the physical shutter."""
         if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None and gp is not None:
             try:
-                camera_file = self._gp_camera.capture_preview(self._gp_context)
-            except TypeError:
                 camera_file = self._gp_camera.capture_preview()
+            except (TypeError, Exception):
+                camera_file = self._gp_camera.capture_preview(self._gp_context)
             file_data = camera_file.get_data_and_size()
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(bytes(file_data))
@@ -527,17 +539,16 @@ class CameraController:
 
         direct_exc = None
         try:
-            file_path = self._gp_camera.capture(gp.GP_CAPTURE_IMAGE, self._gp_context)
+            file_path = self._gp_camera.capture(gp.GP_CAPTURE_IMAGE)
             camera_file = self._gp_camera.file_get(
                 file_path.folder,
                 file_path.name,
                 gp.GP_FILE_TYPE_NORMAL,
-                self._gp_context,
             )
             output_path.parent.mkdir(parents=True, exist_ok=True)
             camera_file.save(str(output_path))
             try:
-                self._gp_camera.file_delete(file_path.folder, file_path.name, self._gp_context)
+                self._gp_camera.file_delete(file_path.folder, file_path.name)
             except Exception:
                 pass
             return
@@ -556,12 +567,11 @@ class CameraController:
                     ev_data.folder,
                     ev_data.name,
                     gp.GP_FILE_TYPE_NORMAL,
-                    self._gp_context,
                 )
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 camera_file.save(str(output_path))
                 try:
-                    self._gp_camera.file_delete(ev_data.folder, ev_data.name, self._gp_context)
+                    self._gp_camera.file_delete(ev_data.folder, ev_data.name)
                 except Exception:
                     pass
                 return
@@ -578,12 +588,11 @@ class CameraController:
                     ev_data.folder,
                     ev_data.name,
                     gp.GP_FILE_TYPE_NORMAL,
-                    self._gp_context,
                 )
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 camera_file.save(str(output_path))
                 try:
-                    self._gp_camera.file_delete(ev_data.folder, ev_data.name, self._gp_context)
+                    self._gp_camera.file_delete(ev_data.folder, ev_data.name)
                 except Exception:
                     pass
                 return
