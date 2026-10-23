@@ -88,6 +88,76 @@
     return `${String(h).padStart(2, '0')}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
   }
 
+  function computeTargetAltAz(target, observer, utcSec) {
+    if (!observer || observer.latitude_deg === undefined || target.ra_hours === undefined || target.dec_deg === undefined) {
+      return { alt: 45.0, az: 180.0, airmass: 1.4 };
+    }
+    const jd = utcSec / 86400.0 + 2440587.5;
+    const d = jd - 2451545.0;
+    const tCent = d / 36525.0;
+    let gmst = (280.46061837 + 360.98564736629 * d + 0.000387933 * tCent * tCent) % 360.0;
+    if (gmst < 0) gmst += 360.0;
+    const lstDeg = ((gmst + (observer.longitude_deg || 0)) % 360.0 + 360.0) % 360.0;
+    const haDeg = (lstDeg - target.ra_hours * 15.0) % 360.0;
+
+    const latRad = (observer.latitude_deg * Math.PI) / 180.0;
+    const decRad = (target.dec_deg * Math.PI) / 180.0;
+    const haRad = (haDeg * Math.PI) / 180.0;
+
+    const sinAlt = Math.sin(latRad) * Math.sin(decRad) + Math.cos(latRad) * Math.cos(decRad) * Math.cos(haRad);
+    let altDeg = (Math.asin(Math.max(-1.0, Math.min(1.0, sinAlt))) * 180.0) / Math.PI;
+
+    // Bennett atmospheric refraction correction (apparent altitude)
+    if (altDeg > -1.0) {
+      const rArcmin = 1.02 / Math.tan(((altDeg + 10.3 / (altDeg + 5.11)) * Math.PI) / 180.0);
+      altDeg += rArcmin / 60.0;
+    }
+
+    const cosAz = (Math.sin(decRad) - Math.sin(latRad) * Math.sin((altDeg * Math.PI) / 180.0)) / (Math.cos(latRad) * Math.cos((altDeg * Math.PI) / 180.0));
+    const sinAz = (-Math.cos(decRad) * Math.sin(haRad)) / Math.cos((altDeg * Math.PI) / 180.0);
+    let azDeg = (Math.atan2(sinAz, cosAz) * 180.0) / Math.PI;
+    if (azDeg < 0) azDeg += 360.0;
+
+    let airmass = null;
+    if (altDeg > 5.0) {
+      airmass = Math.round((1.0 / Math.sin((Math.max(5.0, altDeg) * Math.PI) / 180.0)) * 100) / 100;
+    }
+
+    return {
+      alt: Math.round(altDeg * 10) / 10,
+      az: Math.round(azDeg * 10) / 10,
+      airmass,
+    };
+  }
+
+  function enrichCatalogLive(targets) {
+    const obs = store.state?.observer || { latitude_deg: 35.3395, longitude_deg: -97.4867 };
+    const nowSec = (store.state?.observer?.clock_offset_s !== undefined)
+      ? (Date.now() / 1000 + (store.state.observer.clock_offset_s || 0))
+      : (Date.now() / 1000);
+
+    const enriched = targets.map((t) => {
+      const coords = computeTargetAltAz(t, obs, nowSec);
+      return {
+        ...t,
+        current_alt_deg: coords.alt,
+        current_az_deg: coords.az,
+        airmass: coords.airmass,
+        visible_now: coords.alt >= 20.0,
+      };
+    });
+
+    enriched.sort((a, b) => {
+      const aFocus = a.object_type === 'Focus Star';
+      const bFocus = b.object_type === 'Focus Star';
+      if (aFocus !== bFocus) return aFocus ? 1 : -1;
+      if (a.is_tpo180_pick !== b.is_tpo180_pick) return a.is_tpo180_pick ? -1 : 1;
+      return (b.current_alt_deg ?? -90) - (a.current_alt_deg ?? -90);
+    });
+
+    return enriched;
+  }
+
   function formatDuration(totalSec) {
     const s = Math.max(0, Math.round(totalSec));
     const m = Math.floor(s / 60);
@@ -107,7 +177,9 @@
       if (store.catalogSearch.trim()) q.set('search', store.catalogSearch.trim());
       if (store.catalogAboveHorizon) q.set('min_alt', '5');
       if (store.catalogTpo180Only) q.set('tpo180_only', 'true');
-      const cat = await api(`/api/framing/catalog?${q.toString()}`);
+      const qStr = q.toString();
+      const path = qStr ? `/api/framing/catalog?${qStr}` : '/api/framing/catalog';
+      const cat = await api(path);
       if (cat && cat.items && cat.items.length > 0) {
         const liveMap = new Map(cat.items.map(it => [it.id, it]));
         store.catalog = DEFAULT_TARGETS.map(def => liveMap.get(def.id) || def);
@@ -133,8 +205,8 @@
     }
     render();
 
-    if (store.activeTab === 'FRAME' && store.catalog.length === 0) {
-      loadCatalog();
+    if (store.activeTab === 'FRAME') {
+      loadCatalog().catch(() => {});
     }
     if (store.activeTab === 'SEQUENCE') {
       try {
@@ -631,7 +703,8 @@
     const isFraming = store.subTabFrame === 'FRAMING';
 
     if (isFraming) {
-      const allTargets = (store.catalog && store.catalog.length > 0) ? store.catalog : DEFAULT_TARGETS;
+      const rawTargets = (store.catalog && store.catalog.length > 0) ? store.catalog : DEFAULT_TARGETS;
+      const allTargets = enrichCatalogLive(rawTargets);
 
       // Group targets for the quick-pick dropdown
       const tpoPicks = allTargets.filter(t => t.is_tpo180_pick);
@@ -1386,7 +1459,8 @@
       store.catalogSearch = t.value;
       const listEl = document.getElementById('framing-catalog-list');
       if (listEl) {
-        const allTargets = (store.catalog && store.catalog.length > 0) ? store.catalog : DEFAULT_TARGETS;
+        const rawTargets = (store.catalog && store.catalog.length > 0) ? store.catalog : DEFAULT_TARGETS;
+        const allTargets = enrichCatalogLive(rawTargets);
         let visibleCatalog = allTargets;
         if (store.catalogTpo180Only) {
           visibleCatalog = visibleCatalog.filter(item => item.is_tpo180_pick);
@@ -1464,7 +1538,8 @@
         render();
         return;
       }
-      const allTargets = (store.catalog && store.catalog.length > 0) ? store.catalog : DEFAULT_TARGETS;
+      const rawTargets = (store.catalog && store.catalog.length > 0) ? store.catalog : DEFAULT_TARGETS;
+      const allTargets = enrichCatalogLive(rawTargets);
       const item = allTargets.find((c) => c.id === selectedId);
       if (item) {
         await api('/api/framing/select-target', 'POST', {
@@ -1499,8 +1574,8 @@
       store.activeTab = btn.dataset.tab;
       store.abortArmed = false;
       render();
-      if (store.activeTab === 'FRAME' && store.catalog.length === 0) {
-        loadCatalog();
+      if (store.activeTab === 'FRAME') {
+        loadCatalog().catch(() => {});
       }
       refreshAll().catch(() => {});
       return;
