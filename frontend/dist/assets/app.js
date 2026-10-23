@@ -30,6 +30,8 @@
     abortArmed: false,
     wsConnected: false,
     zoom: 1.0,
+    liveLoopRunning: false,
+    catalogLoading: false,
   };
 
   // Web Audio Cues for Dark-Sky Eyes-Free Operation
@@ -79,37 +81,67 @@
   }
 
   async function loadCatalog() {
-    const q = new URLSearchParams();
-    if (store.catalogSearch.trim()) q.set('search', store.catalogSearch.trim());
-    if (store.catalogAboveHorizon) q.set('min_alt', '5');
-    if (store.catalogTpo180Only) q.set('tpo180_only', 'true');
-    const cat = await api(`/api/framing/catalog?${q.toString()}`);
-    store.catalog = cat.items || [];
+    if (store.catalogLoading) return;
+    store.catalogLoading = true;
+    try {
+      const q = new URLSearchParams();
+      if (store.catalogSearch.trim()) q.set('search', store.catalogSearch.trim());
+      if (store.catalogAboveHorizon) q.set('min_alt', '5');
+      if (store.catalogTpo180Only) q.set('tpo180_only', 'true');
+      const cat = await api(`/api/framing/catalog?${q.toString()}`);
+      store.catalog = cat.items || [];
+    } catch (err) {
+      console.warn('Failed to load catalog:', err);
+    } finally {
+      store.catalogLoading = false;
+      render();
+    }
   }
 
   async function refreshAll() {
-    store.state = await api('/api/system/state');
+    try {
+      store.state = await api('/api/system/state');
+    } catch (err) {
+      console.warn('Failed to fetch system state:', err);
+    }
+    render();
+
     if (store.activeTab === 'FRAME' && store.catalog.length === 0) {
-      await loadCatalog();
+      loadCatalog();
     }
     if (store.activeTab === 'SEQUENCE') {
-      const p = await api('/api/sequence/plans');
-      store.plans = p.plans || [];
-      if (!store.editingSteps && store.plans.length > 0) {
-        const first = store.plans[0];
-        store.editingPlanId = first.id;
-        store.editingPlanName = first.name;
-        store.editingSteps = (first.steps || []).map((st) => ({ ...st }));
+      try {
+        const p = await api('/api/sequence/plans');
+        store.plans = p.plans || [];
+        if (!store.editingSteps && store.plans.length > 0) {
+          const first = store.plans[0];
+          store.editingPlanId = first.id;
+          store.editingPlanName = first.name;
+          store.editingSteps = (first.steps || []).map((st) => ({ ...st }));
+        }
+        render();
+      } catch (err) {
+        console.warn('Failed to fetch sequence plans:', err);
       }
     }
     if (store.activeTab === 'OFFLOAD') {
-      const s = await api('/api/sessions');
-      store.sessions = s.sessions || [];
-      store.storage = s.storage || null;
+      try {
+        const s = await api('/api/sessions');
+        store.sessions = s.sessions || [];
+        store.storage = s.storage || null;
+        render();
+      } catch (err) {
+        console.warn('Failed to fetch sessions:', err);
+      }
     }
     if (store.drawerOpen && store.presets.length === 0) {
-      const pr = await api('/api/system/presets');
-      store.presets = pr.presets || [];
+      try {
+        const pr = await api('/api/system/presets');
+        store.presets = pr.presets || [];
+        render();
+      } catch (err) {
+        console.warn('Failed to fetch presets:', err);
+      }
     }
     render();
   }
@@ -465,7 +497,7 @@
             </button>
           </div>
 
-          <div class="catalog-list">${catRows || '<div style="padding:12px;font-size:12px;color:var(--text-muted)">No matching objects found.</div>'}</div>
+          <div class="catalog-list">${store.catalogLoading ? '<div style="padding:16px;text-align:center;color:var(--text-muted)">⏳ Calculating live altitudes for 141 targets...</div>' : (catRows || '<div style="padding:12px;font-size:12px;color:var(--text-muted)">No matching objects found.</div>')}</div>
 
           <button class="btn btn-lg btn-primary" data-action="frame-solve">
             📸 CAPTURE &amp; PLATE-SOLVE PUSH-TO OFFSET
@@ -921,8 +953,17 @@
       <header class="hud-header">
         <div class="hud-row">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-            <span class="status-dot ${store.wsConnected && camera.connected ? '' : 'offline'}"></span>
+            <span class="status-dot ${store.wsConnected && !isSim ? '' : (isSim ? 'sim-mode' : 'offline')}"></span>
             <strong style="font-size:14px;letter-spacing:0.04em">ASTROPI</strong>
+            ${
+              isSim
+                ? `<button class="btn btn-sm btn-warn" data-action="connect-camera" title="Camera in simulator mode. Tap to connect physical Canon M200">
+                     ⚡ Connect Camera (Simulator Mode)
+                   </button>`
+                : `<span class="badge badge-raw" style="background:#0e4429;border-color:#3fb950;color:#3fb950;font-weight:700">
+                     🟢 ${camera.model || 'Canon EOS M200 (USB PTP)'}
+                   </span>`
+            }
             <span class="badge ${camera.is_fast_jpg_mode ? 'badge-jpg' : 'badge-raw'}">
               ${camera.is_fast_jpg_mode ? 'FAST JPG (SOLVE)' : 'RAW (.CR3)'}
             </span>
@@ -969,13 +1010,24 @@
               <strong style="font-size:13px">LIVE SKY PREVIEW</strong>
               <span style="font-size:11px;color:var(--text-muted);margin-left:6px">(${preview?.source_format || 'RAW .CR3'})</span>
             </div>
-            <div style="display:flex;gap:6px">
+            <div style="display:flex;gap:6px;align-items:center">
+              <button class="btn btn-sm ${store.liveLoopRunning ? 'btn-warn' : ''}" data-action="toggle-live-loop" title="Continuously capture 1.5s preview frames">
+                ${store.liveLoopRunning ? '⏹ Stop Live Loop' : '▶ Live View Loop'}
+              </button>
               <button class="btn btn-sm ${store.zoom > 1 ? 'btn-active' : ''}" data-action="toggle-zoom">
                 🔍 ${store.zoom > 1 ? '2x Zoom' : '1x Fit'}
               </button>
               <button class="btn btn-sm" data-action="manual-shot">📸 Test Shot</button>
             </div>
           </div>
+          ${
+            isSim
+              ? `<div class="step-banner" style="background:rgba(217,119,6,0.12);border:1px solid #d97706;color:#f59e0b;margin-bottom:8px;font-size:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+                   <span>⚠️ <strong>Simulator Active:</strong> Showing synthetic stars. Turn on Canon M200 in Manual (M) mode.</span>
+                   <button class="btn btn-sm btn-warn" data-action="connect-camera" style="white-space:nowrap">⚡ Connect Camera</button>
+                 </div>`
+              : ''
+          }
           <canvas id="sky-canvas" style="width:100%;border-radius:8px;background:#000;border:1px solid var(--border-col)"></canvas>
           ${renderHistogramSvg(preview?.histogram)}
         </div>
@@ -1036,7 +1088,11 @@
     if (btn.dataset.tab) {
       store.activeTab = btn.dataset.tab;
       store.abortArmed = false;
-      await refreshAll();
+      render();
+      if (store.activeTab === 'FRAME' && store.catalog.length === 0) {
+        loadCatalog();
+      }
+      refreshAll().catch(() => {});
       return;
     }
     if (btn.dataset.subtab) {
@@ -1110,6 +1166,42 @@
         client_utc_timestamp: Date.now() / 1000,
         sync_source: 'Phone Clock Sync',
       });
+      await refreshAll();
+    } else if (act === 'connect-camera') {
+      try {
+        const res = await api('/api/camera/connect', 'POST');
+        if (res.driver_mode === 'gphoto2') {
+          alert('🟢 Success! Connected to physical Canon EOS M200 via USB PTP.');
+        } else {
+          const detail = res.last_error ? `\n\nDiagnostic info: ${res.last_error}` : '';
+          alert(
+            '⚠️ Canon EOS M200 not detected on USB.\n\n' +
+            'Please check:\n' +
+            '1. Camera power is turned ON\n' +
+            '2. Mode dial is set to Manual ("M")\n' +
+            '3. Auto Power Off / Sleep is set to "Disable" in camera menu\n' +
+            '4. USB cable is a DATA sync cable (not charge-only)\n' +
+            '5. Plugged firmly into Raspberry Pi USB port' +
+            detail
+          );
+        }
+      } catch (err) {
+        alert('Failed to connect to camera: ' + err.message);
+      }
+      await refreshAll();
+    } else if (act === 'toggle-live-loop') {
+      if (store.liveLoopRunning) {
+        store.liveLoopRunning = false;
+        render();
+        await api('/api/camera/live-loop/stop', 'POST').catch(() => {});
+      } else {
+        store.liveLoopRunning = true;
+        render();
+        await api('/api/camera/live-loop/start', 'POST', { exposure_s: 1.5, iso: '1600' }).catch(() => {
+          store.liveLoopRunning = false;
+          render();
+        });
+      }
       await refreshAll();
     } else if (act === 'usb-reset') {
       await api('/api/camera/reset-usb', 'POST');
@@ -1320,6 +1412,7 @@
     sync_source: 'Auto Clock Sync',
   }).catch(() => {});
 
-  refreshAll();
+  loadCatalog().catch(() => {});
+  refreshAll().catch(() => {});
   connectWs();
 })();

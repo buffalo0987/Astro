@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from PIL import Image
 
@@ -16,6 +17,58 @@ from ..state import STATE
 from ..web_compat import APIRouter, FileResponse, HTTPException, Response
 
 router = APIRouter(prefix="/api/camera", tags=["camera"])
+
+_preview_loop_task: Optional[asyncio.Task[None]] = None
+_preview_loop_stop = asyncio.Event()
+
+
+async def _preview_loop_worker(exposure_s: float, iso: str) -> None:
+    try:
+        while not _preview_loop_stop.is_set():
+            await capture_manual_preview(
+                {
+                    "exposure_s": exposure_s,
+                    "iso": iso,
+                    "fast_jpeg": True,
+                    "auto_stretch": True,
+                    "restore_raw_after": False,
+                }
+            )
+            await asyncio.sleep(0.40)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await CAMERA.ensure_raw_format()
+        STATE.camera.busy = False
+        await STATE.broadcast("CAMERA_STATUS", CAMERA.status_dict())
+
+
+@router.post("/live-loop/start")
+async def start_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+    global _preview_loop_task
+    body = payload or {}
+    exposure_s = float(body.get("exposure_s", 1.5))
+    iso = str(body.get("iso", "800"))
+    if _preview_loop_task is not None and not _preview_loop_task.done():
+        return {"running": True, "camera": CAMERA.status_dict()}
+    _preview_loop_stop.clear()
+    _preview_loop_task = asyncio.create_task(_preview_loop_worker(exposure_s, iso))
+    return {"running": True, "camera": CAMERA.status_dict()}
+
+
+@router.post("/live-loop/stop")
+async def stop_live_loop() -> Dict[str, Any]:
+    global _preview_loop_task
+    _preview_loop_stop.set()
+    if _preview_loop_task is not None and not _preview_loop_task.done():
+        _preview_loop_task.cancel()
+        try:
+            await _preview_loop_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    _preview_loop_task = None
+    await CAMERA.ensure_raw_format()
+    return {"running": False, "camera": CAMERA.status_dict()}
 
 
 @router.get("/status")

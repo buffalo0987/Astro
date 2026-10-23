@@ -65,32 +65,53 @@ class CameraController:
 
     def _init_sync(self) -> Dict[str, Any]:
         if HAS_GPHOTO2 and gp is not None and not CONFIG.force_simulator:
-            try:
-                self._gp_context = gp.Context()
-                self._gp_camera = gp.Camera()
-                self._gp_camera.init(self._gp_context)
-
-                # Disable camera auto power off if present
-                self._set_widget_sync("autopoweroff", ("0", "Off", "Disable"))
-                self._discover_format_labels_sync()
-                # Enforce Default Safety Invariant: always start in RAW (.CR3)
-                self._set_image_format_sync(fast_jpeg=False)
-
-                STATE.camera.connected = True
-                STATE.camera.driver_mode = "gphoto2"
-                STATE.camera.model = "Canon EOS M200 (USB PTP)"
-                STATE.camera.last_error = None
+            if self._try_reconnect_physical_camera_sync():
                 return self.status_dict()
-            except Exception as exc:
-                self._gp_camera = None
-                STATE.camera.last_error = f"USB PTP fallback to simulator: {exc}"
 
-        STATE.camera.connected = True
+        STATE.camera.connected = False
         STATE.camera.driver_mode = "simulator"
-        STATE.camera.model = "Canon EOS M200 (Simulated)"
+        STATE.camera.model = "Simulator Rig (No Physical Camera Detected)"
         STATE.camera.image_format = "RAW (.CR3)"
         STATE.camera.is_fast_jpg_mode = False
         return self.status_dict()
+
+    def _try_reconnect_physical_camera_sync(self) -> bool:
+        if not HAS_GPHOTO2 or gp is None or CONFIG.force_simulator:
+            return False
+        try:
+            subprocess.run(["pkill", "-9", "-f", "gvfs-gphoto2"], capture_output=True, timeout=1.0)
+        except Exception:
+            pass
+
+        if self._gp_camera is not None:
+            try:
+                self._gp_camera.exit(self._gp_context)
+            except Exception:
+                pass
+            self._gp_camera = None
+
+        try:
+            ctx = gp.Context()
+            cam = gp.Camera()
+            cam.init(ctx)
+            self._gp_context = ctx
+            self._gp_camera = cam
+            self._set_widget_sync("autopoweroff", ("0", "Off", "Disable"))
+            self._discover_format_labels_sync()
+            self._set_image_format_sync(fast_jpeg=False)
+
+            STATE.camera.connected = True
+            STATE.camera.driver_mode = "gphoto2"
+            STATE.camera.model = "Canon EOS M200 (USB PTP)"
+            STATE.camera.last_error = None
+            return True
+        except Exception as exc:
+            self._gp_camera = None
+            STATE.camera.connected = False
+            STATE.camera.driver_mode = "simulator"
+            STATE.camera.model = "Simulator Rig (No Physical Camera Detected)"
+            STATE.camera.last_error = f"USB PTP: {exc}. Ensure camera is ON in Manual (M) mode."
+            return False
 
     def _discover_format_labels_sync(self) -> None:
         if self._gp_camera is None or gp is None:
@@ -225,6 +246,12 @@ class CameraController:
         async with self._capture_lock:
             self._abort_event.clear()
             loop = asyncio.get_running_loop()
+
+            # Auto-detect real physical camera if plugged in or turned on after startup
+            if STATE.camera.driver_mode == "simulator" and HAS_GPHOTO2 and not CONFIG.force_simulator:
+                connected = await loop.run_in_executor(self._executor, self._try_reconnect_physical_camera_sync)
+                if connected:
+                    await STATE.broadcast("CAMERA_STATUS", self.status_dict())
 
             if fast_jpeg:
                 await self.set_fast_jpeg_mode()

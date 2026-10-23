@@ -13,12 +13,43 @@ export const TelemetryHud: React.FC = () => {
         <div className="flex items-center gap-2">
           <span
             className={`inline-block h-3 w-3 rounded-full ${
-              wsConnected && camera.connected ? 'bg-emerald-500' : 'bg-red-600'
+              wsConnected && camera.driver_mode === 'gphoto2'
+                ? 'bg-emerald-500'
+                : camera.driver_mode === 'simulator'
+                ? 'bg-amber-500'
+                : 'bg-red-600'
             }`}
           />
           <span className="font-bold tracking-wide text-sm md:text-base">
-            ASTROPI <span className="text-xs opacity-75">{camera.model}</span>
+            ASTROPI
           </span>
+          {camera.driver_mode === 'simulator' ? (
+            <button
+              type="button"
+              onClick={async () => {
+                const res = await fetch('/api/camera/connect', { method: 'POST' }).then((r) => r.json());
+                if (res.driver_mode === 'gphoto2') {
+                  alert('🟢 Success! Connected to Canon EOS M200 via USB PTP.');
+                } else {
+                  alert(
+                    '⚠️ Canon EOS M200 not detected on USB.\n\n' +
+                      'Please verify:\n' +
+                      '1. Camera power is turned ON\n' +
+                      '2. Mode dial is set to Manual ("M")\n' +
+                      '3. Auto Power Off / Sleep is set to "Disable"\n' +
+                      '4. USB cable is a DATA sync cable (not charge-only)'
+                  );
+                }
+              }}
+              className="px-2 py-0.5 text-xs font-extrabold rounded border border-amber-500 text-amber-300 bg-amber-950/60"
+            >
+              ⚡ Connect Camera (Simulator)
+            </button>
+          ) : (
+            <span className="px-2 py-0.5 text-xs font-extrabold rounded border border-emerald-500 text-emerald-300 bg-emerald-950/60">
+              🟢 {camera.model}
+            </span>
+          )}
           <span
             className={`px-2 py-0.5 text-xs font-extrabold rounded border ${
               camera.is_fast_jpg_mode

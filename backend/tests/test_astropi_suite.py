@@ -193,6 +193,20 @@ class TestAstroPiSuite(unittest.TestCase):
         st_frame_after = self.client.get("/api/camera/status").json()
         self.assertEqual(st_frame_after["image_format"], "RAW (.CR3)")
 
+        # 5. Live Preview Loop and Camera Connect
+        r_conn = self.client.post("/api/camera/connect")
+        self.assertEqual(r_conn.status_code, 200)
+        self.assertIn("driver_mode", r_conn.json())
+
+        r_loop_start = self.client.post("/api/camera/live-loop/start", json={"exposure_s": 1.0, "iso": "800"})
+        self.assertEqual(r_loop_start.status_code, 200)
+        self.assertTrue(r_loop_start.json()["running"])
+
+        r_loop_stop = self.client.post("/api/camera/live-loop/stop")
+        self.assertEqual(r_loop_stop.status_code, 200)
+        self.assertFalse(r_loop_stop.json()["running"])
+        self.assertEqual(self.client.get("/api/camera/status").json()["image_format"], "RAW (.CR3)")
+
     def test_05_sequence_interlocks_culling_and_streaming_zip_offload(self) -> None:
         """Verify multi-step .CR3 sequencing, Light->Dark interlock, Siril culling, and Streaming ZIP offload."""
         plan_resp = self.client.post(

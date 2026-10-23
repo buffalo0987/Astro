@@ -76,6 +76,11 @@ body {
   box-shadow: 0 0 8px var(--accent);
 }
 
+.status-dot.sim-mode {
+  background: var(--warn-col);
+  box-shadow: 0 0 8px var(--warn-col);
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
