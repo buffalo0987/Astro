@@ -172,17 +172,15 @@ CURATED_CATALOG = [
 def ensure_catalog_seeded() -> None:
     """Populate or upgrade SQLite dso_catalog table with all curated & Messier objects."""
     with DB.connection() as conn:
-        cnt = conn.execute("SELECT COUNT(*) AS c FROM dso_catalog").fetchone()["c"]
-        if cnt < len(CURATED_CATALOG):
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO dso_catalog (
-                    id, common_name, catalog_ids, object_type, constellation,
-                    ra_hours, dec_deg, magnitude, size_arcmin, recommended_focal_mm, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                CURATED_CATALOG,
-            )
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO dso_catalog (
+                id, common_name, catalog_ids, object_type, constellation,
+                ra_hours, dec_deg, magnitude, size_arcmin, recommended_focal_mm, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            CURATED_CATALOG,
+        )
 
 
 def query_catalog(
