@@ -11,7 +11,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -43,6 +43,9 @@ class SimulatedRig:
         self.focus_defocus_steps: float = 1.4
         # Simulated flat light source intensity (1.0 => ~46% sRGB ADU at 0.25s @ ISO 100)
         self.flat_panel_ev_flux: float = 1.0
+        # Optional physically calibrated sky background flux (e-/px/s) & star flux multiplier
+        self.sky_flux_e_per_s: Optional[float] = None
+        self.star_flux_scale: float = 1.0
         self.rng = np.random.default_rng(42)
         self._star_catalog = self._generate_star_field(65)
 
@@ -223,6 +226,44 @@ class SimulatedRig:
             srgb = 255.0 * (np.clip(rgb_lin, 0.0, 1.0) ** (1.0 / 2.2))
             noise = rng.normal(loc=1.5, scale=0.8, size=(h, w, 3))
             arr = np.clip(srgb + noise, 0, 255).astype(np.uint8)
+        elif self.sky_flux_e_per_s is not None:
+            from ..imaging.light_exposure_solver import get_eos_m200_sensor_spec, linear_rgb_to_srgb_u8
+
+            spec = get_eos_m200_sensor_spec(str(iso))
+            fwc = spec["full_well_e"]
+            exp_num = max(0.05, float(exposure_s))
+            sky_e = max(0.05, float(self.sky_flux_e_per_s)) * exp_num
+            bg_lin = np.full((h, w, 3), (sky_e / fwc) + 0.0012, dtype=np.float32)
+
+            psf_sigma = 1.45 + 0.55 * abs(self.focus_defocus_steps)
+            rot_rad = math.radians(self.ra_clutch_angle_deg if mode == "PA" else self.camera_roll_deg)
+            cos_r, sin_r = math.cos(rot_rad), math.sin(rot_rad)
+            patch_r = int(max(8, min(18, math.ceil(psf_sigma * 4.5))))
+            py, px = np.mgrid[-patch_r : patch_r + 1, -patch_r : patch_r + 1]
+
+            for sx_n, sy_n, peak in self._star_catalog:
+                dx_n = sx_n - 0.5
+                dy_n = sy_n - 0.5
+                rx_n = 0.5 + dx_n * cos_r - dy_n * sin_r
+                ry_n = 0.5 + dx_n * sin_r + dy_n * cos_r
+                cx = rx_n * w
+                cy = ry_n * h
+                ix, iy = int(round(cx)), int(round(cy))
+                if ix - patch_r < 0 or ix + patch_r + 1 > w or iy - patch_r < 0 or iy + patch_r + 1 > h:
+                    continue
+                sub_dx = cx - ix
+                sub_dy = cy - iy
+                r2 = (px - sub_dx) ** 2 + (py - sub_dy) ** 2
+                star_peak_e = ((peak / 200.0) * 32.0 * float(self.star_flux_scale)) * exp_num
+                psf_lin = (star_peak_e / fwc) * np.exp(-r2 / (2.0 * (psf_sigma**2)))
+                for c, tint in enumerate((1.0, 0.96, 0.92)):
+                    bg_lin[iy - patch_r : iy + patch_r + 1, ix - patch_r : ix + patch_r + 1, c] += (
+                        psf_lin * tint
+                    ).astype(np.float32)
+
+            arr_clean = linear_rgb_to_srgb_u8(bg_lin)
+            noise = rng.normal(loc=0.0, scale=1.2, size=(h, w, 3))
+            arr = np.clip(arr_clean.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         else:
             # Sky background + faint H-alpha nebula glow + Gaussian stars
             bg = rng.normal(loc=22.0, scale=2.0, size=(h, w, 3)).astype(np.float32)

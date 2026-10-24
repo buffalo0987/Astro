@@ -43,6 +43,7 @@
     flatCalibratedIso: null,
     flatCalibratedLabel: null,
     lastAutoFlat: null,
+    lastAutoLight: null,
     notice: null,
     busyAction: null,
   };
@@ -1329,6 +1330,14 @@
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
               <button
+                class="btn btn-sm btn-primary"
+                data-action="seq-auto-light"
+                ${store.busyAction || isRunning ? 'disabled' : ''}
+                title="Shoot a 4s sky probe, plate-solve Declination, factor in SA2i tracking + PA drift, and solve optimal Light Exposure &amp; ISO"
+              >
+                ${store.busyAction === 'auto-light' ? '⏳ Analyzing Sky...' : '🧠 Auto-Expose Lights'}
+              </button>
+              <button
                 class="btn btn-sm"
                 data-action="seq-auto-flat"
                 ${store.busyAction || sequence.status === 'RUNNING' ? 'disabled' : ''}
@@ -1342,6 +1351,29 @@
               </button>
             </div>
           </div>
+
+          ${
+            store.lastAutoLight && !sequence.interlock_required
+              ? (() => {
+                  const L = store.lastAutoLight;
+                  const decSign = L.dec_deg >= 0 ? '+' : '';
+                  const decBadge = L.declination_source === 'plate_solved' ? 'Plate-Solved' : 'Target';
+                  return `
+                    <div style="font-size:11px;padding:7px 10px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--border-col);line-height:1.5">
+                      <div style="color:${L.pa_tip ? 'var(--warn-col)' : 'var(--ok-col)'}">
+                        🧠 <strong>Auto-Light Applied:</strong> <strong>${L.exposure_s}s @ ISO ${L.iso}</strong> (${L.uses_bulb ? 'EOS Bulb' : 'Native Shutter'}) — synced Dark &amp; Bias steps
+                      </div>
+                      <div style="color:var(--text-muted)">
+                        <strong>SA2i Ceiling:</strong> ${Math.round(L.sa2i_max_exposure_s)}s (Dec ${decSign}${L.dec_deg}° [${decBadge}], PA ${L.pa_error_arcmin}') •
+                        <strong>Skyfog:</strong> ~${L.projected_skyfog_pct}% ADU (${L.sky_rate_e_per_s} e⁻/s, ${L.swamp_factor}× RN², ${L.snr_efficiency_pct}% SNR eff) •
+                        <strong>Limit:</strong> ${L.limiting_factor}
+                      </div>
+                      ${L.pa_tip ? `<div style="color:var(--warn-col);margin-top:2px">⚠️ ${L.pa_tip}</div>` : ''}
+                    </div>
+                  `;
+                })()
+              : ''
+          }
 
           ${
             store.lastAutoFlat && store.lastAutoFlat.converged && !sequence.interlock_required
@@ -2231,6 +2263,45 @@
       } else if (act === 'seq-resume') {
         await api('/api/sequence/resume', 'POST');
         await refreshAll();
+      } else if (act === 'seq-auto-light') {
+        store.busyAction = 'auto-light';
+        store.histMode = 'LIGHT';
+        render();
+        const res = await api('/api/camera/auto-light', 'POST', {});
+        store.lastAutoLight = res;
+        if (!store.editingSteps) store.editingSteps = [];
+        let updatedLight = false;
+        const newExp = Number(res.exposure_s);
+        const newIso = String(res.iso);
+
+        for (const st of store.editingSteps) {
+          if (st.frame_type === 'Light') {
+            const prevTotalSec = Number(st.total_count || 0) * Number(st.exposure_s || 0);
+            if (prevTotalSec >= 600 && newExp > 0) {
+              st.total_count = Math.max(5, Math.round(prevTotalSec / newExp));
+            }
+            st.exposure_s = newExp;
+            st.iso = newIso;
+            updatedLight = true;
+          } else if (st.frame_type === 'Dark') {
+            st.exposure_s = newExp;
+            st.iso = newIso;
+          } else if (st.frame_type === 'Bias') {
+            st.iso = newIso;
+          }
+        }
+        if (!updatedLight) {
+          store.editingSteps.unshift({
+            frame_type: 'Light',
+            exposure_s: newExp,
+            iso: newIso,
+            total_count: Math.max(10, Math.round(3600 / Math.max(10, newExp))),
+            cooldown_s: 2.0,
+          });
+        }
+        store.planSavedBanner = false;
+        await refreshAll();
+        showNotice(res.message, res.pa_tip ? 'warn' : 'ok', 10000);
       } else if (act === 'seq-auto-flat') {
         store.busyAction = 'auto-flat';
         store.histMode = 'FLAT';

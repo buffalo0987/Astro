@@ -7,6 +7,7 @@ import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..astrometry.astap_runner import ASTAP
 from ..config import CONFIG
 from ..hardware.camera_actor import (
     CAMERA,
@@ -14,6 +15,7 @@ from ..hardware.camera_actor import (
     parse_canon_shutter_choice,
 )
 from ..hardware.simulated_camera import SIM_RIG
+from ..imaging.light_exposure_solver import solve_optimal_light_exposure
 from ..imaging.pipeline import LAST_UNSTRETCHED_PATH, process_and_publish_preview
 from ..state import STATE
 from ..web_compat import APIRouter, FileResponse, HTTPException, Response
@@ -499,6 +501,149 @@ async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     finally:
         if has_sim_override:
             SIM_RIG.flat_panel_ev_flux = prev_sim_flux
+        await CAMERA.ensure_raw_format()
+
+
+@router.post("/auto-light")
+async def auto_expose_light(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Automatically solve optimal Light sub-exposure & ISO from plate-solved sky & SA2i tracking.
+
+    Captures a fast 4s @ ISO 1600 sky probe, plate-solves via ASTAP to determine exact live
+    Declination (or falls back gracefully to selected target Declination), reads Step 1 Polar
+    Alignment error, measures unstretched sky background rate + bright-star saturation headroom,
+    and returns optimal (exposure_s, iso) + full tracking/SNR telemetry before restoring RAW (.CR3).
+    """
+    if STATE.camera.exposing or (
+        STATE.active_mode == "SEQUENCE" and STATE.sequence_state.get("status") == "RUNNING"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot run Auto-Light solver while an exposure or imaging sequence is actively running.",
+        )
+
+    body = payload or {}
+    probe_exp_s = max(0.5, min(15.0, float(body.get("probe_exposure_s", 4.0))))
+    probe_iso = str(body.get("probe_iso", "1600")).strip()
+
+    await stop_live_loop_quietly()
+    try:
+        from .routes_framing import stop_focus_loop
+        from .routes_pa import stop_pa_live_loop
+
+        if STATE.pa_state.get("loop_running"):
+            await stop_pa_live_loop({"restore_raw": False})
+        if STATE.focus_state.get("loop_running"):
+            await stop_focus_loop()
+    except Exception:
+        pass
+
+    prev_sky_flux = SIM_RIG.sky_flux_e_per_s
+    prev_star_scale = SIM_RIG.star_flux_scale
+    prev_dec = SIM_RIG.pointing_dec_deg
+    is_sim = STATE.camera.driver_mode == "simulator"
+
+    if is_sim:
+        if "sim_sky_e_per_s" in body and body["sim_sky_e_per_s"] is not None:
+            SIM_RIG.sky_flux_e_per_s = float(body["sim_sky_e_per_s"])
+        if "sim_star_scale" in body and body["sim_star_scale"] is not None:
+            SIM_RIG.star_flux_scale = float(body["sim_star_scale"])
+        if "sim_dec_deg" in body and body["sim_dec_deg"] is not None:
+            SIM_RIG.pointing_dec_deg = float(body["sim_dec_deg"])
+
+    probe_file = CONFIG.shm_dir / "auto_light_probe.jpg"
+
+    try:
+        await CAMERA.capture_frame(
+            output_path=probe_file,
+            exposure_s=probe_exp_s,
+            iso=probe_iso,
+            fast_jpeg=True,
+            frame_type="Light",
+            mode="FRAME",
+            max_retries=1,
+        )
+        preview, star_metrics = await process_and_publish_preview(
+            source_path=probe_file,
+            max_dim=1400,
+            enable_stretch=STATE.auto_stretch_enabled,
+            compute_hfr=True,
+            jpeg_quality=85,
+            source_label="Auto-Light Probe (S1)",
+            max_overlay_stars=20,
+            meta={"exposure_s": probe_exp_s, "iso": probe_iso, "frame_type": "Light"},
+            broadcast=True,
+        )
+        hist = preview.get("histogram") or {}
+
+        # If extreme skyglow/twilight compressed the 4s ISO 1600 probe (>175 ADU), bracket down with 1s @ ISO 400
+        if float(hist.get("median_adu", 0.0)) > 175.0:
+            probe_exp_s = 1.0
+            probe_iso = "400"
+            await CAMERA.capture_frame(
+                output_path=probe_file,
+                exposure_s=probe_exp_s,
+                iso=probe_iso,
+                fast_jpeg=True,
+                frame_type="Light",
+                mode="FRAME",
+                max_retries=1,
+            )
+            preview, star_metrics = await process_and_publish_preview(
+                source_path=probe_file,
+                max_dim=1400,
+                enable_stretch=STATE.auto_stretch_enabled,
+                compute_hfr=True,
+                jpeg_quality=85,
+                source_label="Auto-Light Probe (S1)",
+                max_overlay_stars=20,
+                meta={"exposure_s": probe_exp_s, "iso": probe_iso, "frame_type": "Light"},
+                broadcast=True,
+            )
+            hist = preview.get("histogram") or {}
+
+        # Attempt ASTAP plate-solve on the probe shot for live sky Declination; fall back gracefully
+        solve = await ASTAP.solve_image(probe_file, force_blind=False)
+        if solve.solved:
+            dec_deg = float(solve.dec_deg)
+            declination_source = "plate_solved"
+        else:
+            dec_deg = float(STATE.framing_state.get("target_dec_deg") or 44.33)
+            declination_source = "selected_target"
+
+        pa_pts = len(STATE.pa_state.get("points") or [])
+        pa_needed = int(STATE.pa_state.get("mode_points") or 3)
+        pa_calibrated = bool(pa_pts >= pa_needed or STATE.pa_state.get("phase") == "LIVE_ADJUST")
+        if is_sim and "sim_pa_error_arcmin" in body and body["sim_pa_error_arcmin"] is not None:
+            pa_err_arcmin = max(0.2, float(body["sim_pa_error_arcmin"]))
+            pa_calibrated = True
+        elif pa_calibrated:
+            pa_err_arcmin = max(0.2, float(STATE.pa_state.get("total_error_arcmin") or 1.5))
+        else:
+            pa_err_arcmin = 4.0
+
+        solution = solve_optimal_light_exposure(
+            hist=hist,
+            star_metrics=star_metrics,
+            probe_exposure_s=probe_exp_s,
+            probe_iso=probe_iso,
+            dec_deg=dec_deg,
+            declination_source=declination_source,
+            pa_error_arcmin=pa_err_arcmin,
+            pa_calibrated=pa_calibrated,
+        )
+        solution["plate_solved"] = bool(solve.solved)
+        solution["solved_ra_hours"] = round(float(solve.ra_hours), 4) if solve.solved else None
+        solution["preview"] = STATE.latest_preview
+        return solution
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Auto-Light solver error: {exc}")
+    finally:
+        if is_sim:
+            SIM_RIG.sky_flux_e_per_s = prev_sky_flux
+            SIM_RIG.star_flux_scale = prev_star_scale
+            SIM_RIG.pointing_dec_deg = prev_dec
         await CAMERA.ensure_raw_format()
 
 

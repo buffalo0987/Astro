@@ -594,6 +594,79 @@ class TestAstroPiSuite(unittest.TestCase):
             self.client.delete(f"/api/sessions/{target_sess['id']}")
             self.client.delete("/api/sequence/plans/plan_test_autoflat_seq")
 
+    def test_10_auto_light_exposure_solver_and_sa2i_tracking_limits(self) -> None:
+        """Verify physics-based Auto-Light solver across Bortle 8, Dark Sky, Dual-Band Dec limits, PA drift, and bright starfields."""
+        # 1. Bortle 8 Broadband in Cygnus (Dec +44.3 deg, tight PA 1.5') -> ISO 400 native shutter (20s-30s)
+        r_b8 = self.client.post(
+            "/api/camera/auto-light",
+            json={"sim_sky_e_per_s": 12.0, "sim_dec_deg": 44.33, "sim_pa_error_arcmin": 1.5},
+        )
+        self.assertEqual(r_b8.status_code, 200)
+        d_b8 = r_b8.json()
+        self.assertTrue(d_b8["plate_solved"])
+        self.assertEqual(d_b8["declination_source"], "plate_solved")
+        self.assertEqual(d_b8["iso"], "400")
+        self.assertIn(d_b8["exposure_s"], (20, 25, 30))
+        self.assertFalse(d_b8["uses_bulb"])
+        self.assertGreaterEqual(d_b8["projected_skyfog_pct"], 18)
+        self.assertLessEqual(d_b8["projected_skyfog_pct"], 32)
+        self.assertEqual(self.client.get("/api/camera/status").json()["image_format"], "RAW (.CR3)")
+
+        # 2. Dark Sky Broadband on M31 (Dec +41.3 deg, tight PA 1.5') -> 90s Bulb @ ISO 800
+        r_dark = self.client.post(
+            "/api/camera/auto-light",
+            json={"sim_sky_e_per_s": 1.5, "sim_dec_deg": 41.27, "sim_pa_error_arcmin": 1.5},
+        )
+        self.assertEqual(r_dark.status_code, 200)
+        d_dark = r_dark.json()
+        self.assertEqual(d_dark["iso"], "800")
+        self.assertIn(d_dark["exposure_s"], (75, 90, 105))
+        self.assertTrue(d_dark["uses_bulb"])
+        self.assertGreater(d_dark["snr_efficiency_pct"], 95.0)
+
+        # 3. Dual-Band Narrowband at High Dec (Heart Nebula Dec +61.5 deg, PA 1.2') -> cos(Dec) unlocks >=120s @ ISO 800
+        r_nb_hi = self.client.post(
+            "/api/camera/auto-light",
+            json={"sim_sky_e_per_s": 0.42, "sim_dec_deg": 61.5, "sim_pa_error_arcmin": 1.2},
+        )
+        self.assertEqual(r_nb_hi.status_code, 200)
+        d_nb_hi = r_nb_hi.json()
+        self.assertGreaterEqual(d_nb_hi["sa2i_max_exposure_s"], 130.0)
+        self.assertGreaterEqual(d_nb_hi["exposure_s"], 120)
+        self.assertEqual(d_nb_hi["iso"], "800")
+
+        # 4. Dual-Band Narrowband near Celestial Equator (Orion M42 Dec -5.4 deg, PA 1.5') -> SA2i caps at 60s & boosts to ISO 1600
+        r_nb_eq = self.client.post(
+            "/api/camera/auto-light",
+            json={"sim_sky_e_per_s": 0.28, "sim_dec_deg": -5.4, "sim_pa_error_arcmin": 1.5},
+        )
+        self.assertEqual(r_nb_eq.status_code, 200)
+        d_nb_eq = r_nb_eq.json()
+        self.assertLessEqual(d_nb_eq["sa2i_max_exposure_s"], 73.0)
+        self.assertEqual(d_nb_eq["exposure_s"], 60)
+        self.assertEqual(d_nb_eq["iso"], "1600")
+
+        # 5. Rough Polar Alignment (20' error) at High Dec -> PA drift caps exposure & emits actionable PA tip
+        r_bad_pa = self.client.post(
+            "/api/camera/auto-light",
+            json={"sim_sky_e_per_s": 0.50, "sim_dec_deg": 61.5, "sim_pa_error_arcmin": 20.0},
+        )
+        self.assertEqual(r_bad_pa.status_code, 200)
+        d_bad_pa = r_bad_pa.json()
+        self.assertLessEqual(d_bad_pa["sa2i_max_exposure_s"], 70.0)
+        self.assertLessEqual(d_bad_pa["exposure_s"], 60)
+        self.assertIsNotNone(d_bad_pa["pa_tip"])
+
+        # 6. Brilliant Star Cluster (M45 Pleiades with intense star cores) -> drops to ISO 400 to protect star color
+        r_cluster = self.client.post(
+            "/api/camera/auto-light",
+            json={"sim_sky_e_per_s": 3.2, "sim_star_scale": 7.0, "sim_dec_deg": 24.1, "sim_pa_error_arcmin": 1.5},
+        )
+        self.assertEqual(r_cluster.status_code, 200)
+        d_cluster = r_cluster.json()
+        self.assertEqual(d_cluster["iso"], "400")
+        self.assertIn("Star", d_cluster["limiting_factor"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
