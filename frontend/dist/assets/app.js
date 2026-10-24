@@ -38,6 +38,8 @@
     catalogLoading: false,
     manualExposure: '2',
     manualIso: '1600',
+    histMode: 'AUTO', // 'AUTO' | 'LIGHT' | 'FLAT'
+    flatCalibratedExp: null,
     notice: null,
     busyAction: null,
   };
@@ -339,7 +341,19 @@
               playTone(Math.max(240, 900 - msg.payload.hfr_median * 110), 90);
             }
           } else if (msg.type === 'SEQUENCE_PROGRESS' || msg.type === 'INTERLOCK_PROMPT') {
-            if (msg.type === 'INTERLOCK_PROMPT') playTone(440, 220, 'sawtooth');
+            if (msg.type === 'INTERLOCK_PROMPT') {
+              playTone(440, 220, 'sawtooth');
+              store.flatCalibratedExp = null;
+              if (msg.payload?.interlock_type === 'Flat') {
+                store.histMode = 'FLAT';
+                if (msg.payload.pending_step_exposure_s) {
+                  store.manualExposure = String(msg.payload.pending_step_exposure_s);
+                }
+                if (msg.payload.pending_step_iso) {
+                  store.manualIso = String(msg.payload.pending_step_iso);
+                }
+              }
+            }
             store.state.sequence = msg.payload;
           }
           render();
@@ -585,34 +599,121 @@
     });
   }
 
+  const PREVIEW_EXP_OPTIONS = [
+    { val: '0.001', label: '1/1000s' },
+    { val: '0.004', label: '1/250s' },
+    { val: '0.0167', label: '1/60s' },
+    { val: '0.0667', label: '1/15s' },
+    { val: '0.25', label: '1/4s' },
+    { val: '0.5', label: '0.5s' },
+    { val: '1', label: '1s' },
+    { val: '1.6', label: '1.6s' },
+    { val: '2', label: '2s' },
+    { val: '3.2', label: '3.2s' },
+    { val: '5', label: '5s' },
+    { val: '8', label: '8s' },
+    { val: '10', label: '10s' },
+    { val: '15', label: '15s' },
+    { val: '20', label: '20s' },
+    { val: '30', label: '30s' },
+  ];
+
+  function isFlatHistActive() {
+    if (store.histMode === 'FLAT') return true;
+    if (store.histMode === 'LIGHT') return false;
+    const seq = store.state?.sequence;
+    if (seq && (seq.interlock_type === 'Flat' || seq.current_frame_type === 'Flat')) return true;
+    if (store.state?.preview?.meta?.frame_type === 'Flat') return true;
+    return false;
+  }
+
+  function evaluateFlatHistogram(hist) {
+    if (!hist) return { pct: 0, ok: false, label: 'Capture a test shot to check Flat ADU (target 35–55%)' };
+    const med = Number(hist.median_adu ?? 0);
+    const pct = Math.round((med / 255) * 100);
+    const maxChP99 = Number(hist.max_channel_p99_adu ?? hist.p99_adu ?? 0);
+    if (maxChP99 >= 242) {
+      return { pct, ok: false, warn: true, label: '⚠️ CHANNEL CLIPPING (>95%) — Shorten Exp or Dim Panel!' };
+    }
+    if (pct > 55) {
+      return { pct, ok: false, warn: true, label: `⚠️ Too Bright (${pct}% > 55%) — Shorten Flat Exposure` };
+    }
+    if (pct < 35) {
+      return { pct, ok: false, warn: true, label: `⚠️ Underexposed (${pct}% < 35%) — Lengthen Flat Exposure` };
+    }
+    return { pct, ok: true, warn: false, label: '✓ Optimal Siril Flat Zone (35–55% • No Channel Clipping)' };
+  }
+
   function renderHistogramSvg(hist) {
     if (!hist || !hist.luma || hist.luma.length === 0) return '';
     const bins = hist.luma;
     const w = 320;
-    const h = 44;
-    const col = store.nightVision ? '#ff1a1a' : '#ef4444';
+    const h = 46;
+    const flatMode = isFlatHistActive();
     const med = Number(hist.median_adu ?? 50);
-    const skyfogPct = Math.round((med / 255) * 100);
-    let zoneLabel = 'Optimal Skyfog Zone (15–35%) ✓';
-    if (skyfogPct > 40) zoneLabel = '⚠️ High Skyglow (>40%) — Lower Exp/ISO';
-    else if (skyfogPct < 10) zoneLabel = 'Low Skyfog (<10%) — Can Increase Exp';
+    const aduPct = Math.round((med / 255) * 100);
 
-    const pts = bins
-      .map((v, i) => {
-        const x = (i / (bins.length - 1)) * w;
-        const y = h - Math.min(1, Math.max(0, v)) * (h - 6) - 2;
-        return `${x.toFixed(1)},${y.toFixed(1)}`;
-      })
-      .join(' ');
+    const buildPts = (arr) =>
+      (arr || [])
+        .map((v, i) => {
+          const x = (i / Math.max(1, arr.length - 1)) * w;
+          const y = h - Math.min(1, Math.max(0, v)) * (h - 6) - 2;
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        })
+        .join(' ');
+
+    const ptsLuma = buildPts(bins);
+    const rgbCurves =
+      !store.nightVision && hist.r && hist.g && hist.b
+        ? `<polyline fill="none" stroke="#ef4444" stroke-opacity="0.45" stroke-width="1.1" points="${buildPts(hist.r)}" />
+           <polyline fill="none" stroke="#22c55e" stroke-opacity="0.45" stroke-width="1.1" points="${buildPts(hist.g)}" />
+           <polyline fill="none" stroke="#3b82f6" stroke-opacity="0.45" stroke-width="1.1" points="${buildPts(hist.b)}" />`
+        : '';
+
+    let headerText = '';
+    let zoneLabel = '';
+    let zoneStart = 0.15;
+    let zoneWidth = 0.20;
+    let zoneCol = store.nightVision ? '#ff1a1a' : '#ef4444';
+    const lumaCol = store.nightVision ? '#ff1a1a' : (flatMode ? '#f8fafc' : '#ef4444');
+
+    if (flatMode) {
+      const flatEval = evaluateFlatHistogram(hist);
+      const rPct = hist.r_median_adu !== undefined ? Math.round((hist.r_median_adu / 255) * 100) : aduPct;
+      const gPct = hist.g_median_adu !== undefined ? Math.round((hist.g_median_adu / 255) * 100) : aduPct;
+      const bPct = hist.b_median_adu !== undefined ? Math.round((hist.b_median_adu / 255) * 100) : aduPct;
+      headerText = `FLAT ADU GUIDE: ${aduPct}% (${med} ADU) • R:${rPct}% G:${gPct}% B:${bPct}%`;
+      zoneLabel = flatEval.label;
+      zoneStart = 0.35;
+      zoneWidth = 0.20;
+      zoneCol = store.nightVision ? '#ff1a1a' : (flatEval.ok ? '#10b981' : '#f59e0b');
+    } else {
+      headerText = `SKYFOG HISTOGRAM: ${aduPct}% (${med} ADU)`;
+      zoneLabel = 'Optimal Skyfog Zone (15–35%) ✓';
+      if (aduPct > 40) zoneLabel = '⚠️ High Skyglow (>40%) — Lower Exp/ISO';
+      else if (aduPct < 10) zoneLabel = 'Low Skyfog (<10%) — Can Increase Exp';
+    }
+
+    const clipLine = flatMode
+      ? `<line x1="${(w * 0.95).toFixed(1)}" y1="0" x2="${(w * 0.95).toFixed(1)}" y2="${h}" stroke="${store.nightVision ? '#ff1a1a' : '#ef4444'}" stroke-dasharray="3 2" stroke-width="1.2" />`
+      : '';
+
     return `
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:4px;border-top:1px solid var(--border-col);flex-wrap:wrap">
-        <div style="font-size:11px;color:var(--text-muted)">
-          <div><strong>SKYFOG HISTOGRAM: ${skyfogPct}% (${med} ADU)</strong></div>
-          <div>${zoneLabel}</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:6px;border-top:1px solid var(--border-col);flex-wrap:wrap">
+        <div style="font-size:11px;color:var(--text-muted);display:grid;gap:2px">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <strong style="color:var(--text-main)">${headerText}</strong>
+            <button class="btn btn-sm ${flatMode ? 'btn-active' : ''}" data-action="toggle-hist-mode" style="min-height:22px;padding:1px 7px;font-size:10px" title="Switch histogram target guide between Light Skyfog (15–35%) and Siril Flat ADU (35–55%)">
+              ${flatMode ? '⬜ Mode: Flat ADU (35–55%)' : '🌌 Mode: Skyfog (15–35%)'}
+            </button>
+          </div>
+          <div style="color:${flatMode ? (evaluateFlatHistogram(hist).ok ? 'var(--ok-col)' : 'var(--warn-col)') : 'var(--text-muted)'}">${zoneLabel}</div>
         </div>
-        <svg viewBox="0 0 ${w} ${h}" style="flex:1;max-width:250px;height:40px;background:var(--bg-oled);border:1px solid var(--border-col);border-radius:6px">
-          <rect x="${w * 0.15}" y="0" width="${w * 0.2}" height="${h}" fill="${col}" opacity="0.12" />
-          <polyline fill="none" stroke="${col}" stroke-width="1.8" points="${pts}" />
+        <svg viewBox="0 0 ${w} ${h}" style="flex:1;max-width:255px;height:42px;background:var(--bg-oled);border:1px solid var(--border-col);border-radius:6px">
+          <rect x="${(w * zoneStart).toFixed(1)}" y="0" width="${(w * zoneWidth).toFixed(1)}" height="${h}" fill="${zoneCol}" opacity="0.18" />
+          ${clipLine}
+          ${rgbCurves}
+          <polyline fill="none" stroke="${lumaCol}" stroke-width="1.8" points="${ptsLuma}" />
         </svg>
       </div>
     `;
@@ -1107,6 +1208,29 @@
             ? `<div class="step-banner" style="border-left-color:var(--warn-col);background:var(--warn-bg);display:grid;gap:8px">
                  <div><strong>⚠️ PHYSICAL CALIBRATION INTERLOCK: ${sequence.interlock_type}</strong></div>
                  <div>${sequence.interlock_message}</div>
+                 ${
+                   sequence.interlock_type === 'Flat'
+                     ? (() => {
+                         const fEval = evaluateFlatHistogram(store.state?.preview?.histogram);
+                         const flatIso = sequence.pending_step_iso || '100';
+                         const curExpOpt = PREVIEW_EXP_OPTIONS.find((o) => Number(o.val) === Number(store.manualExposure));
+                         const expLabel = curExpOpt ? curExpOpt.label : `${store.manualExposure}s`;
+                         return `
+                           <div style="background:var(--bg-oled);border:1px solid var(--border-col);border-radius:6px;padding:8px 10px;font-size:12px;display:grid;gap:6px">
+                             <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+                               <span><strong>Siril Flat ADU Check (Target 35–55%):</strong> ${fEval.label}</span>
+                               <button class="btn btn-sm" data-action="flat-test-shot" ${store.busyAction ? 'disabled' : ''}>
+                                 ${store.busyAction === 'flat-test-shot' ? '⏳ Measuring Flat...' : `📸 Test Flat (${expLabel} @ ISO ${flatIso})`}
+                               </button>
+                             </div>
+                             <div style="font-size:11px;color:var(--text-muted)">
+                               Adjust <strong>EXP</strong> on the Live Sky Preview bar and tap <strong>Test Flat</strong> until ADU lands in <strong>35–55%</strong>${store.flatCalibratedExp !== null ? ` (Will run Flats at calibrated <strong>${store.flatCalibratedExp}s</strong> ✓)` : ''}.
+                             </div>
+                           </div>
+                         `;
+                       })()
+                     : ''
+                 }
                  <button class="btn btn-lg btn-primary" data-action="seq-confirm-interlock">
                    ${interlockBtnLabel}
                  </button>
@@ -1244,12 +1368,18 @@
              </div>`
           : '';
 
+        const fc = s.frame_counts || {};
+        const countsBadge = `Lights: ${fc.light ?? 0} • Darks: ${fc.dark ?? 0} • Flats: ${fc.flat ?? 0} • Biases: ${fc.bias ?? 0}`;
+
         return `
           <div class="kpi-box" style="text-align:left;display:flex;flex-direction:column;gap:8px">
             <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
               <div>
                 <strong style="font-size:14px">${s.target_name}</strong>
                 <span style="font-size:11px;color:var(--text-muted);margin-left:6px">(${s.id})</span>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:2px">
+                  ${countsBadge} • Auto-generates <code>siril_stack.ssf</code> (180mm, 3.72µm, SPCC-ready)
+                </div>
               </div>
               <span class="badge badge-raw">
                 Kept: ${s.accepted_frames} | Rejected: ${s.rejected_frames} | ${s.total_size_mb} MB
@@ -1257,7 +1387,10 @@
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <a class="btn btn-sm btn-primary" style="text-decoration:none" href="/api/sessions/${s.id}/download.zip?exclude_rejected=true">
-                ⬇ Download Siril ZIP (Kept Only)
+                ⬇ Download Siril ZIP (+ siril_stack.ssf)
+              </a>
+              <a class="btn btn-sm" style="text-decoration:none" href="/api/sessions/${s.id}/siril_stack.ssf" title="Download custom Siril 1.2+ preprocessing & plate-solve script">
+                📜 Siril Script (.ssf)
               </a>
               <button class="btn btn-sm" data-action="sess-toggle-frames" data-session="${s.id}">
                 ${isExp ? 'Hide Sub-Frames ▲' : `Inspect / Cull Frames (${frames.length}) ▼`}
@@ -1538,7 +1671,7 @@
               <div style="display:flex;align-items:center;gap:3px">
                 <span style="font-size:11px;font-weight:700;color:var(--text-muted)">EXP:</span>
                 <select id="preview-exp-sel" class="ctrl-sel">
-                  ${['0.5', '1', '1.6', '2', '3.2', '5', '8', '10', '15', '20', '30'].map((s) => `<option value="${s}" ${store.manualExposure == s ? 'selected' : ''}>${s}s</option>`).join('')}
+                  ${PREVIEW_EXP_OPTIONS.map((o) => `<option value="${o.val}" ${Number(store.manualExposure) === Number(o.val) ? 'selected' : ''}>${o.label}</option>`).join('')}
                 </select>
               </div>
               <div style="display:flex;align-items:center;gap:3px">
@@ -1760,6 +1893,9 @@
       } else if (act === 'toggle-stretch') {
         await api('/api/camera/preview-stretch', 'POST', {});
         await refreshAll();
+      } else if (act === 'toggle-hist-mode') {
+        store.histMode = isFlatHistActive() ? 'LIGHT' : 'FLAT';
+        render();
       } else if (act === 'toggle-zoom') {
         if (store.zoom === 1.0) {
           store.zoom = 2.0;
@@ -2060,8 +2196,29 @@
       } else if (act === 'seq-resume') {
         await api('/api/sequence/resume', 'POST');
         await refreshAll();
+      } else if (act === 'flat-test-shot') {
+        store.busyAction = 'flat-test-shot';
+        store.histMode = 'FLAT';
+        render();
+        const flatIso = String(store.state?.sequence?.pending_step_iso || '100');
+        await api('/api/camera/capture', 'POST', {
+          exposure_s: expVal,
+          iso: flatIso,
+          fast_jpeg: true,
+          auto_stretch: false,
+        });
+        store.flatCalibratedExp = expVal;
+        await refreshAll();
+        const fEval = evaluateFlatHistogram(store.state?.preview?.histogram);
+        showNotice(`Flat Test (${expVal}s @ ISO ${flatIso}): ${fEval.pct}% ADU — ${fEval.label}`, fEval.ok ? 'ok' : 'warn', 8000);
       } else if (act === 'seq-confirm-interlock') {
-        await api('/api/sequence/confirm-interlock', 'POST');
+        const confirmPayload = {};
+        if (store.state?.sequence?.interlock_type === 'Flat' && store.flatCalibratedExp !== null) {
+          confirmPayload.exposure_s = Number(store.flatCalibratedExp);
+        }
+        store.flatCalibratedExp = null;
+        if (store.histMode === 'FLAT') store.histMode = 'AUTO';
+        await api('/api/sequence/confirm-interlock', 'POST', confirmPayload);
         await refreshAll();
       } else if (act === 'seq-abort') {
         if (!store.abortArmed) {

@@ -85,8 +85,14 @@ async def resume_sequence() -> Dict[str, Any]:
 
 
 @router.post("/confirm-interlock")
-async def confirm_sequence_interlock() -> Dict[str, Any]:
-    return await SEQUENCER.confirm_interlock()
+async def confirm_sequence_interlock(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+    body = payload or {}
+    exp_override = float(body["exposure_s"]) if "exposure_s" in body and body["exposure_s"] is not None else None
+    iso_override = str(body["iso"]) if "iso" in body and body["iso"] is not None else None
+    return await SEQUENCER.confirm_interlock(
+        override_exposure_s=exp_override,
+        override_iso=iso_override,
+    )
 
 
 @router.post("/abort")

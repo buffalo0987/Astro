@@ -8,7 +8,7 @@ from typing import Any, Dict
 from ..db import DB
 from ..imaging.zip_streamer import stream_zip_stored_async
 from ..sequencer.storage import STORAGE
-from ..web_compat import APIRouter, FileResponse, HTTPException, StreamingResponse
+from ..web_compat import APIRouter, FileResponse, HTTPException, Response, StreamingResponse
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions_offload"])
 
@@ -92,6 +92,23 @@ async def download_single_cr3_frame(session_id: str, frame_id: str) -> FileRespo
         raw_path,
         media_type="application/octet-stream",
         filename=f_row["filename"],
+    )
+
+
+@router.get("/{session_id}/siril_stack.ssf")
+async def download_session_siril_script(session_id: str) -> Response:
+    """Generate and download a custom Siril 1.2+ .ssf script tailored to this session's frames."""
+    ssf_text, _ = STORAGE.generate_siril_script(session_id)
+    if not ssf_text:
+        raise HTTPException(status_code=404, detail="Session not found")
+    STORAGE.write_session_manifests(session_id)
+    return Response(
+        content=ssf_text.encode("utf-8"),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="siril_stack.ssf"',
+            "Cache-Control": "no-store",
+        },
     )
 
 

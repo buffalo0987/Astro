@@ -61,20 +61,21 @@ def _process_preview_sync(
     else:
         raise ValueError("Either source_path or jpeg_bytes must be provided")
 
-    # Cache compact unstretched RGB in /dev/shm so toggling Stretch ON/OFF is instant without re-shooting
+    # Normalize unstretched 8-bit base image once: used both for true exposure histogram
+    # (Skyfog 15-35% & Flat 35-55% ADU guides) and for instant Stretch ON/OFF retoggling!
+    u8_base = (
+        arr_rgb
+        if arr_rgb.dtype == np.uint8
+        else auto_stretch_rgb(arr_rgb, enable_stretch=False)
+    )
     if cache_source_for_retoggle and jpeg_bytes is None:
         try:
-            u8_base = (
-                arr_rgb
-                if arr_rgb.dtype == np.uint8
-                else auto_stretch_rgb(arr_rgb, enable_stretch=False)
-            )
             Image.fromarray(u8_base).save(LAST_UNSTRETCHED_PATH, format="JPEG", quality=92)
         except Exception:
             pass
 
-    stretched = auto_stretch_rgb(arr_rgb, enable_stretch=do_stretch)
-    hist = compute_histogram_256(stretched)
+    hist = compute_histogram_256(u8_base)
+    stretched = auto_stretch_rgb(u8_base, enable_stretch=do_stretch) if do_stretch else u8_base
 
     if compute_hfr:
         metrics = compute_star_hfr_metrics(arr_rgb)

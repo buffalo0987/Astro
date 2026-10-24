@@ -160,7 +160,17 @@ class SequenceEngine:
         if not space_check["ok"]:
             raise RuntimeError(space_check["message"])
 
-        session = STORAGE.ensure_session_directory(plan["target_name"])
+        ra_h = plan.get("target_ra_hours")
+        dec_d = plan.get("target_dec_deg")
+        if ra_h is None and STATE.framing_state.get("target_name") == plan["target_name"]:
+            ra_h = STATE.framing_state.get("target_ra_hours")
+            dec_d = STATE.framing_state.get("target_dec_deg")
+
+        session = STORAGE.ensure_session_directory(
+            plan["target_name"],
+            target_ra_hours=ra_h,
+            target_dec_deg=dec_d,
+        )
 
         with DB.connection() as conn:
             if reset_progress:
@@ -180,8 +190,9 @@ class SequenceEngine:
         await CAMERA.ensure_raw_format()
 
         self._abort_requested = False
+        self._pause_event = asyncio.Event()
         self._pause_event.set()
-        self._interlock_event.clear()
+        self._interlock_event = asyncio.Event()
         STATE.active_mode = "SEQUENCE"
 
         self._task = asyncio.create_task(self._run_sequence_loop(plan_id, session["id"]))
@@ -209,10 +220,27 @@ class SequenceEngine:
         await STATE.broadcast("SEQUENCE_PROGRESS", STATE.sequence_state)
         return STATE.sequence_state
 
-    async def confirm_interlock(self) -> Dict[str, Any]:
+    async def confirm_interlock(
+        self,
+        override_exposure_s: Optional[float] = None,
+        override_iso: Optional[str] = None,
+    ) -> Dict[str, Any]:
         pid = STATE.sequence_state.get("active_plan_id")
+        step_idx = STATE.sequence_state.get("active_step_index")
         if pid:
             with DB.connection() as conn:
+                if step_idx is not None and (override_exposure_s is not None or override_iso is not None):
+                    s_row = conn.execute(
+                        "SELECT id, exposure_s, iso FROM sequence_steps WHERE plan_id = ? AND step_order = ?",
+                        (pid, int(step_idx)),
+                    ).fetchone()
+                    if s_row:
+                        new_exp = float(override_exposure_s) if override_exposure_s is not None else float(s_row["exposure_s"])
+                        new_iso = str(override_iso) if override_iso is not None else str(s_row["iso"])
+                        conn.execute(
+                            "UPDATE sequence_steps SET exposure_s = ?, iso = ? WHERE id = ?",
+                            (new_exp, new_iso, s_row["id"]),
+                        )
                 conn.execute(
                     """
                     UPDATE sequence_plans
@@ -284,23 +312,30 @@ class SequenceEngine:
                         conn.execute(
                             """
                             UPDATE sequence_plans
-                            SET status = 'AWAITING_INTERLOCK', pending_interlock_type = ?, pending_interlock_message = ?, updated_at = ?
+                            SET status = 'AWAITING_INTERLOCK', active_step_index = ?, pending_interlock_type = ?, pending_interlock_message = ?, updated_at = ?
                             WHERE id = ?
                             """,
-                            (frame_type, msg, time.time(), plan_id),
+                            (step_idx, frame_type, msg, time.time(), plan_id),
                         )
                     STATE.sequence_state.update(
                         {
                             "status": "AWAITING_INTERLOCK",
+                            "active_step_index": step_idx,
                             "interlock_required": True,
                             "interlock_type": frame_type,
                             "interlock_message": msg,
+                            "pending_step_exposure_s": float(step["exposure_s"]),
+                            "pending_step_iso": str(step["iso"]),
                         }
                     )
                     await STATE.broadcast("INTERLOCK_PROMPT", STATE.sequence_state)
                     await self._interlock_event.wait()
                     if self._abort_requested:
                         break
+                    # Reload step in case user calibrated Flat exposure/ISO during the interlock pause
+                    refreshed_steps = self.get_plan(plan_id)["steps"]
+                    if step_idx < len(refreshed_steps):
+                        step = refreshed_steps[step_idx]
 
                 prev_frame_type = frame_type
 
@@ -350,11 +385,13 @@ class SequenceEngine:
                     thumb_rel = f"previews/{Path(filename).stem}_thumb.jpg"
                     thumb_abs = session_dir / thumb_rel
                     is_light = frame_type.lower() == "light"
+                    is_flat = frame_type.lower() == "flat"
 
                     # Offload Tier-1 embedded JPEG extraction, MTF stretch, histogram, HFR & thumbnail save to thread
                     _, metrics = await process_and_publish_preview(
                         source_path=abs_path,
                         max_dim=1280,
+                        enable_stretch=False if is_flat else None,
                         compute_hfr=is_light,
                         jpeg_quality=85,
                         thumbnail_path=thumb_abs,
@@ -366,7 +403,7 @@ class SequenceEngine:
                             "exposure_s": step["exposure_s"],
                             "iso": step["iso"],
                         },
-                        broadcast=False,
+                        broadcast=True,
                     )
 
                     fsize = abs_path.stat().st_size if abs_path.exists() else 0

@@ -147,7 +147,13 @@ class StorageManager:
             ),
         }
 
-    def ensure_session_directory(self, target_name: str, session_date: Optional[str] = None) -> Dict[str, Any]:
+    def ensure_session_directory(
+        self,
+        target_name: str,
+        session_date: Optional[str] = None,
+        target_ra_hours: Optional[float] = None,
+        target_dec_deg: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Create or retrieve a Siril/WBPP-compatible session directory and DB record."""
         date_str = session_date or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
         slug = sanitize_slug(target_name)
@@ -159,16 +165,39 @@ class StorageManager:
 
         now = time.time()
         with DB.connection() as conn:
+            # Fallback to catalog coordinates if not explicitly provided
+            if target_ra_hours is None or target_dec_deg is None:
+                cat_row = conn.execute(
+                    "SELECT ra_hours, dec_deg FROM dso_catalog WHERE common_name = ? OR id = ? LIMIT 1",
+                    (target_name, target_name),
+                ).fetchone()
+                if cat_row:
+                    target_ra_hours = float(cat_row["ra_hours"])
+                    target_dec_deg = float(cat_row["dec_deg"])
+
             conn.execute(
                 """
                 INSERT INTO capture_sessions (
-                    id, target_name, target_slug, session_date, directory_path, offloaded, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                    id, target_name, target_slug, target_ra_hours, target_dec_deg,
+                    session_date, directory_path, offloaded, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     directory_path = excluded.directory_path,
+                    target_ra_hours = COALESCE(excluded.target_ra_hours, capture_sessions.target_ra_hours),
+                    target_dec_deg = COALESCE(excluded.target_dec_deg, capture_sessions.target_dec_deg),
                     updated_at = excluded.updated_at
                 """,
-                (session_id, target_name, slug, date_str, str(session_dir), now, now),
+                (
+                    session_id,
+                    target_name,
+                    slug,
+                    target_ra_hours,
+                    target_dec_deg,
+                    date_str,
+                    str(session_dir),
+                    now,
+                    now,
+                ),
             )
             row = conn.execute("SELECT * FROM capture_sessions WHERE id = ?", (session_id,)).fetchone()
             return dict(row)
@@ -317,6 +346,208 @@ class StorageManager:
             for fr in frames:
                 writer.writerow({k: fr.get(k, "") for k in fieldnames})
 
+        ssf_text, readme_text = self.generate_siril_script(session_id)
+        if ssf_text:
+            (session_dir / "siril_stack.ssf").write_text(ssf_text, encoding="utf-8")
+        if readme_text:
+            (session_dir / "SIRIL_README.txt").write_text(readme_text, encoding="utf-8")
+
+    def generate_siril_script(self, session_id: str) -> Tuple[str, str]:
+        """Generate a custom Siril 1.2+ .ssf preprocessing script tailored to accepted session frames."""
+        with DB.connection() as conn:
+            s_row = conn.execute("SELECT * FROM capture_sessions WHERE id = ?", (session_id,)).fetchone()
+            if not s_row:
+                return "", ""
+            session = dict(s_row)
+            frames = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM captured_frames WHERE session_id = ? AND status = 'accepted' ORDER BY captured_at ASC",
+                    (session_id,),
+                ).fetchall()
+            ]
+            ra_h = session.get("target_ra_hours")
+            dec_d = session.get("target_dec_deg")
+            if ra_h is None or dec_d is None:
+                p_row = conn.execute(
+                    "SELECT target_ra_hours, target_dec_deg FROM sequence_plans WHERE session_id = ? AND target_ra_hours IS NOT NULL LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if p_row:
+                    ra_h = p_row["target_ra_hours"]
+                    dec_d = p_row["target_dec_deg"]
+
+        counts = {"light": 0, "dark": 0, "bias": 0, "flat": 0}
+        total_light_exp_s = 0.0
+        for fr in frames:
+            ft = str(fr.get("frame_type", "")).lower()
+            if ft in counts:
+                counts[ft] += 1
+                if ft == "light":
+                    total_light_exp_s += float(fr.get("exposure_s") or 0.0)
+
+        slug = sanitize_slug(session["target_name"])
+        focal_mm = CONFIG.optics.focal_length_mm
+        pix_um = CONFIG.optics.pixel_pitch_um
+        int_sec = int(round(total_light_exp_s))
+        result_stem = f"result_{slug}_{int_sec}s" if int_sec > 0 else f"result_{slug}"
+
+        lines: List[str] = [
+            "############################################",
+            f"# AstroPi Auto-Generated Siril Script ({session['id']})",
+            f"# Target   : {session['target_name']}",
+            f"# Optics   : {CONFIG.optics.lens_name} ({focal_mm:g}mm) + {CONFIG.optics.camera_name} ({pix_um:g}um)",
+            f"# Accepted : {counts['light']} Lights | {counts['dark']} Darks | {counts['flat']} Flats | {counts['bias']} Biases",
+            "#",
+            "# HOW TO RUN IN SIRIL:",
+            f"#   1. Click the blue Home icon in Siril and select the '{session['id']}' folder.",
+            "#   2. In Siril's Console / Command line at the bottom, run:  @siril_stack.ssf",
+            "#      (Or copy siril_stack.ssf into your Siril scripts folder and pick it from Scripts menu.)",
+            "############################################",
+            "",
+            "requires 1.2.0",
+            "",
+        ]
+
+        # 1. Master Bias (if captured)
+        if counts["bias"] > 0:
+            lines.append("# --- 1. Master Bias (Offset) ---")
+            lines.append("cd biases")
+            lines.append("convert bias -out=../process")
+            lines.append("cd ../process")
+            if counts["bias"] >= 3:
+                lines.append("stack bias rej 3 3 -nonorm -out=bias_stacked")
+            elif counts["bias"] == 2:
+                lines.append("stack bias rej none -nonorm -out=bias_stacked")
+            else:
+                lines.append("load bias_00001")
+                lines.append("save bias_stacked")
+            lines.append("cd ..")
+            lines.append("")
+
+        # 2. Master Flat (if captured)
+        if counts["flat"] > 0:
+            lines.append("# --- 2. Master Flat ---")
+            lines.append("cd flats")
+            lines.append("convert flat -out=../process")
+            lines.append("cd ../process")
+            if counts["bias"] > 0:
+                lines.append("calibrate flat -bias=bias_stacked")
+            else:
+                # Canon EOS M200 14-bit CR3 native optical black pedestal = 2048 ADU
+                lines.append('calibrate flat -bias="=2048"')
+            if counts["flat"] >= 3:
+                lines.append("stack pp_flat rej 3 3 -norm=mul -out=pp_flat_stacked")
+            elif counts["flat"] == 2:
+                lines.append("stack pp_flat rej none -norm=mul -out=pp_flat_stacked")
+            else:
+                lines.append("load pp_flat_00001")
+                lines.append("save pp_flat_stacked")
+            lines.append("cd ..")
+            lines.append("")
+
+        # 3. Master Dark (if captured)
+        if counts["dark"] > 0:
+            lines.append("# --- 3. Master Dark ---")
+            lines.append("cd darks")
+            lines.append("convert dark -out=../process")
+            lines.append("cd ../process")
+            if counts["dark"] >= 3:
+                lines.append("stack dark rej 3 3 -nonorm -out=dark_stacked")
+            elif counts["dark"] == 2:
+                lines.append("stack dark rej none -nonorm -out=dark_stacked")
+            else:
+                lines.append("load dark_00001")
+                lines.append("save dark_stacked")
+            lines.append("cd ..")
+            lines.append("")
+
+        # 4. Light Calibration, Per-Sub Skyglow Subtraction, Registration & Stacking
+        if counts["light"] > 0:
+            lines.append("# --- 4. Calibrate, Background-Extract, Register & Stack Lights ---")
+            lines.append("cd lights")
+            lines.append("convert light -out=../process")
+            lines.append("cd ../process")
+
+            cal_parts = ["calibrate light"]
+            if counts["dark"] > 0:
+                # Do NOT also pass -bias when using uncalibrated Master Dark (avoids double-subtracting bias!)
+                cal_parts.append("-dark=dark_stacked")
+            elif counts["bias"] > 0:
+                cal_parts.append("-bias=bias_stacked")
+            else:
+                cal_parts.append('-bias="=2048"')
+
+            if counts["flat"] > 0:
+                cal_parts.append("-flat=pp_flat_stacked")
+            if counts["dark"] > 0:
+                cal_parts.append("-cc=dark")
+            cal_parts.append("-cfa")
+            if counts["flat"] > 0:
+                cal_parts.append("-equalize_cfa")
+            cal_parts.append("-debayer")
+            lines.append(" ".join(cal_parts))
+
+            if counts["light"] >= 2:
+                # Remove linear skyglow gradient per sub-frame before alignment (ideal for Bortle 8 / wide-field)
+                lines.append("seqsubsky pp_light 1")
+                lines.append("register bkg_pp_light")
+                rej_clause = "rej 3 3" if counts["light"] >= 3 else "rej none"
+                lines.append(
+                    f"stack r_bkg_pp_light {rej_clause} -norm=addscale -output_norm -rgb_equal -out=../{result_stem}"
+                )
+            else:
+                lines.append("load pp_light_00001")
+                lines.append("subsky 1")
+                lines.append(f"save ../{result_stem}")
+
+            lines.append("cd ..")
+            lines.append(f"load {result_stem}")
+            lines.append(f'update_key OBJECT "{slug}"')
+            lines.append('update_key INSTRUME "Canon_EOS_M200"')
+            lines.append('update_key TELESCOP "TPO_UltraWide_180_f4.5"')
+            lines.append(f"update_key FOCALLEN {focal_mm:.1f}")
+            lines.append(f"update_key XPIXSZ {pix_um:.2f}")
+            lines.append(f"update_key YPIXSZ {pix_um:.2f}")
+            lines.append(f"save {result_stem}")
+            lines.append("")
+            lines.append("# --- 5. Astrometric Plate-Solve (Prepares stack for 1-click SPCC / PCC) ---")
+            if ra_h is not None and dec_d is not None:
+                ra_deg = float(ra_h) * 15.0
+                lines.append(
+                    f"platesolve {ra_deg:.5f}, {float(dec_d):+.5f} -focal={focal_mm:.1f} -pixelsize={pix_um:.2f}"
+                )
+            else:
+                lines.append(f"platesolve -focal={focal_mm:.1f} -pixelsize={pix_um:.2f}")
+            lines.append(f"save {result_stem}")
+        else:
+            lines.append("# (No accepted Light frames recorded in this session yet.)")
+
+        lines.append("")
+        ssf_content = "\n".join(lines)
+
+        readme = (
+            f"AstroPi Siril Post-Processing Quickstart — {session['target_name']} ({session['session_date']})\n"
+            "========================================================================\n\n"
+            f"Accepted Frames:\n"
+            f"  - Lights : {counts['light']} ({int_sec}s total integration)\n"
+            f"  - Darks  : {counts['dark']}\n"
+            f"  - Flats  : {counts['flat']}\n"
+            f"  - Biases : {counts['bias']}\n\n"
+            "1-Click Stacking Instructions:\n"
+            "  1. Open Siril (v1.2 or newer).\n"
+            "  2. Tip to save 65%+ disk space: open Preferences -> FITS Options and enable\n"
+            "     'FITS Compression' (Rice).\n"
+            f"  3. Click the blue 'Home' button in Siril's top bar and choose this '{session['id']}' folder.\n"
+            "  4. In the 'Command line' input box at the bottom of Siril, type:\n"
+            "       @siril_stack.ssf\n"
+            "     and press Enter!\n\n"
+            f"When finished, '{result_stem}.fit' will be stacked, gradient-cleaned, plate-solved\n"
+            f"(180mm, 3.72um), and loaded on screen ready for Spectrophotometric Color Calibration (SPCC),\n"
+            "Generalized Hyperbolic Stretch (GHS), and StarNet!\n"
+        )
+        return ssf_content, readme
+
     def set_frame_cull_status(
         self,
         frame_id: str,
@@ -440,6 +671,13 @@ class StorageManager:
                 ]
                 s["best_hfr"] = round(min(light_hfrs), 2) if light_hfrs else None
                 s["median_hfr"] = round(float(np.median(light_hfrs)), 2) if light_hfrs else None
+                accepted = [f for f in frames if f["status"] == "accepted"]
+                s["frame_counts"] = {
+                    "light": sum(1 for f in accepted if f["frame_type"].lower() == "light"),
+                    "dark": sum(1 for f in accepted if f["frame_type"].lower() == "dark"),
+                    "flat": sum(1 for f in accepted if f["frame_type"].lower() == "flat"),
+                    "bias": sum(1 for f in accepted if f["frame_type"].lower() == "bias"),
+                }
         return sessions
 
     def collect_session_zip_entries(
@@ -472,10 +710,13 @@ class StorageManager:
             if disk_path.is_file():
                 entries.append((disk_path, f"{root_folder}/{fr['relative_path']}"))
 
-        for manifest_name in ("session_manifest.csv", "session_manifest.json"):
-            m_path = session_dir / manifest_name
+        # Ensure custom Siril script & quickstart guide are freshly generated before streaming ZIP
+        self.write_session_manifests(session_id)
+
+        for extra_name in ("siril_stack.ssf", "SIRIL_README.txt", "session_manifest.csv", "session_manifest.json"):
+            m_path = session_dir / extra_name
             if m_path.is_file():
-                entries.append((m_path, f"{root_folder}/{manifest_name}"))
+                entries.append((m_path, f"{root_folder}/{extra_name}"))
 
         return f"{root_folder}.zip", entries
 

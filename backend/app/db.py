@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS capture_sessions (
     id TEXT PRIMARY KEY,
     target_name TEXT NOT NULL,
     target_slug TEXT NOT NULL,
+    target_ra_hours REAL,
+    target_dec_deg REAL,
     session_date TEXT NOT NULL,
     directory_path TEXT NOT NULL,
     offloaded INTEGER NOT NULL DEFAULT 0,
@@ -134,6 +136,15 @@ class Database:
             conn = self._connect()
             try:
                 conn.executescript(SCHEMA_SQL)
+                # Backward-compatible schema migrations for existing Pi installations
+                cols = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(capture_sessions)").fetchall()
+                }
+                if "target_ra_hours" not in cols:
+                    conn.execute("ALTER TABLE capture_sessions ADD COLUMN target_ra_hours REAL")
+                if "target_dec_deg" not in cols:
+                    conn.execute("ALTER TABLE capture_sessions ADD COLUMN target_dec_deg REAL")
                 conn.commit()
                 self._seed_defaults(conn)
             finally:

@@ -111,6 +111,7 @@ class CameraController:
 
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="CanonM200Actor")
+        self._bound_loop: Optional[asyncio.AbstractEventLoop] = None
         self._capture_lock = asyncio.Lock()
         self._abort_event = asyncio.Event()
         self._gp_camera: Any = None
@@ -518,6 +519,12 @@ class CameraController:
         """Execute a thread-safe camera exposure (<=30s native or >30s Bulb) with USB auto-retry."""
         # Automatically pause/stop any active EVF Live Viewfinder loop before locking camera
         await self._run_pre_capture_hooks()
+
+        cur_loop = asyncio.get_running_loop()
+        if self._bound_loop is not cur_loop:
+            self._bound_loop = cur_loop
+            self._capture_lock = asyncio.Lock()
+            self._abort_event = asyncio.Event()
 
         async with self._capture_lock:
             self._abort_event.clear()

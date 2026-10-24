@@ -71,25 +71,43 @@ def auto_stretch_rgb(
 
 
 def compute_histogram_256(arr_u8: np.ndarray, bins: int = 64) -> Dict[str, Any]:
-    """Compute compact down-binned RGB + Luminance histograms and sky background stats."""
+    """Compute compact down-binned RGB + Luminance histograms and unstretched ADU / clipping stats."""
     sub = arr_u8[::2, ::2]
     if sub.ndim == 3 and sub.shape[2] >= 3:
-        r_hist, _ = np.histogram(sub[:, :, 0], bins=bins, range=(0, 256))
-        g_hist, _ = np.histogram(sub[:, :, 1], bins=bins, range=(0, 256))
-        b_hist, _ = np.histogram(sub[:, :, 2], bins=bins, range=(0, 256))
+        r_ch = sub[:, :, 0]
+        g_ch = sub[:, :, 1]
+        b_ch = sub[:, :, 2]
+        r_hist, _ = np.histogram(r_ch, bins=bins, range=(0, 256))
+        g_hist, _ = np.histogram(g_ch, bins=bins, range=(0, 256))
+        b_hist, _ = np.histogram(b_ch, bins=bins, range=(0, 256))
         # Fast integer BT.601 luma avoids 3x float64 temporary arrays on ARM64 Pi 4
         luma = (
             (
-                77 * sub[:, :, 0].astype(np.uint16)
-                + 150 * sub[:, :, 1].astype(np.uint16)
-                + 29 * sub[:, :, 2].astype(np.uint16)
+                77 * r_ch.astype(np.uint16)
+                + 150 * g_ch.astype(np.uint16)
+                + 29 * b_ch.astype(np.uint16)
             )
             >> 8
         ).astype(np.uint8)
+        r_med = round(float(np.median(r_ch)), 1)
+        g_med = round(float(np.median(g_ch)), 1)
+        b_med = round(float(np.median(b_ch)), 1)
+        max_ch_p99 = round(
+            float(
+                max(
+                    np.percentile(r_ch, 99.0),
+                    np.percentile(g_ch, 99.0),
+                    np.percentile(b_ch, 99.0),
+                )
+            ),
+            1,
+        )
     else:
         luma = sub if sub.ndim == 2 else sub[:, :, 0]
         r_hist, _ = np.histogram(luma, bins=bins, range=(0, 256))
         g_hist = b_hist = r_hist
+        r_med = g_med = b_med = round(float(np.median(luma)), 1)
+        max_ch_p99 = round(float(np.percentile(luma, 99.0)), 1)
 
     l_hist, _ = np.histogram(luma, bins=bins, range=(0, 256))
     max_val = max(1, int(max(r_hist.max(), g_hist.max(), b_hist.max(), l_hist.max())))
@@ -103,6 +121,10 @@ def compute_histogram_256(arr_u8: np.ndarray, bins: int = 64) -> Dict[str, Any]:
         "median_adu": round(float(np.median(luma)), 1),
         "mean_adu": round(float(np.mean(luma)), 1),
         "p99_adu": round(float(np.percentile(luma, 99.0)), 1),
+        "r_median_adu": r_med,
+        "g_median_adu": g_med,
+        "b_median_adu": b_med,
+        "max_channel_p99_adu": max_ch_p99,
     }
 
 

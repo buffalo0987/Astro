@@ -372,6 +372,96 @@ class TestAstroPiSuite(unittest.TestCase):
         self.assertEqual(r_cat.status_code, 200)
         self.assertGreaterEqual(len(r_cat.json()["items"]), 100)
 
+    def test_08_siril_ssf_script_generation_and_flat_adu_histogram(self) -> None:
+        """Verify dynamic Siril .ssf script generation, Flat interlock exposure override, and Flat ADU clipping stats."""
+        # 1. Verify Flat ADU histogram stats detect optimal 45% zone AND single-channel clipping
+        optimal_flat = np.full((200, 300, 3), 115, dtype=np.uint8)  # ~45% ADU across R,G,B
+        h_opt = compute_histogram_256(optimal_flat)
+        self.assertAlmostEqual(h_opt["median_adu"], 115.0, delta=1.0)
+        self.assertLess(h_opt["max_channel_p99_adu"], 242.0)
+
+        clipped_blue_flat = np.zeros((200, 300, 3), dtype=np.uint8)
+        clipped_blue_flat[:, :, 0] = 90
+        clipped_blue_flat[:, :, 1] = 115
+        clipped_blue_flat[:, :, 2] = 250  # Clipped blue channel (>242 ADU) while luma is ~120!
+        h_clip = compute_histogram_256(clipped_blue_flat)
+        self.assertLess(h_clip["median_adu"], 140.0)
+        self.assertGreaterEqual(h_clip["max_channel_p99_adu"], 242.0)
+
+        # 2. Run a partial-calibration sequence (Lights + Flats only, NO Darks or Biases)
+        plan_resp = self.client.post(
+            "/api/sequence/plans",
+            json={
+                "id": "plan_test_siril_ssf",
+                "name": "Test Siril Script Sequence",
+                "target_name": "Siril_M31_Test",
+                "target_ra_hours": 0.7123,
+                "target_dec_deg": 41.2692,
+                "steps": [
+                    {"frame_type": "Light", "exposure_s": 1.0, "iso": "800", "total_count": 3, "cooldown_s": 0.05},
+                    {"frame_type": "Flat", "exposure_s": 0.5, "iso": "100", "total_count": 3, "cooldown_s": 0.05},
+                ],
+            },
+        )
+        self.assertEqual(plan_resp.status_code, 200)
+
+        self.assertEqual(
+            self.client.post("/api/sequence/plans/plan_test_siril_ssf/start", json={"reset_progress": True}).status_code,
+            200,
+        )
+
+        # Wait for Flat interlock
+        for _ in range(50):
+            s_state = self.client.get("/api/system/state").json()["sequence"]
+            if s_state["status"] == "AWAITING_INTERLOCK":
+                break
+            self.client._loop.run_until_complete(__import__("asyncio").sleep(0.08))
+
+        self.assertEqual(s_state["status"], "AWAITING_INTERLOCK")
+        self.assertEqual(s_state["interlock_type"], "Flat")
+
+        # Confirm Flat interlock with a newly calibrated Flat exposure (1/15s = 0.0667s)
+        c_resp = self.client.post("/api/sequence/confirm-interlock", json={"exposure_s": 0.0667})
+        self.assertEqual(c_resp.status_code, 200)
+
+        for _ in range(50):
+            s_state = self.client.get("/api/system/state").json()["sequence"]
+            if s_state["status"] == "COMPLETED":
+                break
+            self.client._loop.run_until_complete(__import__("asyncio").sleep(0.08))
+        self.assertEqual(s_state["status"], "COMPLETED")
+
+        sess_list = self.client.get("/api/sessions").json()["sessions"]
+        target_sess = next(s for s in sess_list if "Siril_M31_Test" in s["id"])
+        try:
+            # Verify Flat frames actually ran at overridden 0.0667s exposure!
+            flat_frames = [f for f in target_sess["frames"] if f["frame_type"] == "Flat"]
+            self.assertEqual(len(flat_frames), 3)
+            self.assertAlmostEqual(float(flat_frames[0]["exposure_s"]), 0.0667, places=4)
+
+            # Verify custom siril_stack.ssf endpoint
+            ssf_resp = self.client.get(f"/api/sessions/{target_sess['id']}/siril_stack.ssf")
+            self.assertEqual(ssf_resp.status_code, 200)
+            ssf_text = ssf_resp.text
+            self.assertIn("requires 1.2.0", ssf_text)
+            self.assertNotIn("cd biases", ssf_text)
+            self.assertNotIn("cd darks", ssf_text)
+            self.assertIn('calibrate flat -bias="=2048"', ssf_text)
+            self.assertIn("-flat=pp_flat_stacked", ssf_text)
+            self.assertIn("seqsubsky pp_light 1", ssf_text)
+            self.assertIn("platesolve 10.68450, +41.26920 -focal=180.0 -pixelsize=3.72", ssf_text)
+
+            # Verify Siril ZIP includes both siril_stack.ssf and SIRIL_README.txt
+            zip_resp = self.client.get(f"/api/sessions/{target_sess['id']}/download.zip?exclude_rejected=true")
+            self.assertEqual(zip_resp.status_code, 200)
+            with zipfile.ZipFile(io.BytesIO(zip_resp.content), "r") as zf:
+                names = zf.namelist()
+                self.assertTrue(any(n.endswith("siril_stack.ssf") for n in names))
+                self.assertTrue(any(n.endswith("SIRIL_README.txt") for n in names))
+        finally:
+            self.client.delete(f"/api/sessions/{target_sess['id']}")
+            self.client.delete("/api/sequence/plans/plan_test_siril_ssf")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
