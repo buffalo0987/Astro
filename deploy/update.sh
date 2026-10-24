@@ -63,8 +63,8 @@ fi
 # Ensure correct permissions
 chmod +x "${INSTALL_ROOT}/deploy/"*.sh 2>/dev/null || true
 
-# 3. Update Python dependencies if needed
-echo "[3/4] Checking Python dependencies..."
+# 3. Update Python dependencies & verify ASTAP 180mm star catalog
+echo "[3/5] Checking Python dependencies..."
 if [ -f "${INSTALL_ROOT}/venv/bin/pip" ]; then
   "${INSTALL_ROOT}/venv/bin/pip" install -q -r "${INSTALL_ROOT}/backend/requirements.txt"
 else
@@ -74,8 +74,13 @@ else
   "${INSTALL_ROOT}/venv/bin/pip" install -q -r "${INSTALL_ROOT}/backend/requirements.txt"
 fi
 
-# 4. Reload and restart systemd service
-echo "[4/4] Restarting astropi.service..."
+echo "[4/5] Verifying ASTAP plate-solver & 180mm star catalog..."
+if [ -f "${INSTALL_ROOT}/deploy/ensure_astap.sh" ]; then
+  bash "${INSTALL_ROOT}/deploy/ensure_astap.sh"
+fi
+
+# 5. Reload and restart systemd service
+echo "[5/5] Restarting astropi.service..."
 systemctl daemon-reload
 systemctl restart astropi.service
 

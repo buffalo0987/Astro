@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any, Dict, Optional
-
-from PIL import Image
 
 from ..astrometry.astap_runner import ASTAP
 from ..astrometry.coordinates import ObserverLocation
@@ -14,8 +11,7 @@ from ..astrometry.polar_align import PA_ENGINE
 from ..config import CONFIG
 from ..hardware.camera_actor import CAMERA
 from ..hardware.simulated_camera import SIM_RIG
-from ..imaging.cr3_parser import decode_cr3_preview_array
-from ..imaging.stretch import auto_stretch_rgb, compute_histogram_256
+from ..imaging.pipeline import process_and_publish_preview
 from ..state import STATE
 from ..web_compat import APIRouter, HTTPException
 
@@ -66,6 +62,7 @@ async def start_pa_workflow(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     STATE.pa_state.update(PA_ENGINE.to_dict(obs))
     STATE.pa_state["phase"] = "CALIBRATING"
     STATE.pa_state["loop_running"] = False
+    STATE.pa_state["solve_warning"] = None
     await STATE.broadcast("PA_STATE", STATE.pa_state)
     return STATE.pa_state
 
@@ -86,33 +83,39 @@ async def capture_pa_calibration_point(payload: Dict[str, Any] = None) -> Dict[s
         SIM_RIG.rotate_ra_clutch(28.0)
 
     frame_path = CONFIG.shm_dir / "pa_frame.jpg"
-    await CAMERA.capture_frame(
-        output_path=frame_path,
-        exposure_s=exposure_s,
-        iso=iso,
-        fast_jpeg=True,
-        frame_type="Light",
-        mode="PA",
-    )
+    try:
+        await CAMERA.capture_frame(
+            output_path=frame_path,
+            exposure_s=exposure_s,
+            iso=iso,
+            fast_jpeg=True,
+            frame_type="Light",
+            mode="PA",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Camera capture failed: {exc}") from exc
+
     utc_ts = STATE.observer.current_utc_timestamp()
+
+    # Always publish stretched preview + star metrics FIRST so user sees the sky frame even if solve fails
+    _, metrics = await process_and_publish_preview(
+        source_path=frame_path,
+        max_dim=1280,
+        compute_hfr=True,
+        jpeg_quality=82,
+        source_label="Small Fine JPEG (PA)",
+        max_overlay_stars=15,
+        meta={"exposure_s": exposure_s, "iso": iso, "mode": "PA"},
+        broadcast=True,
+    )
+
     solve = await ASTAP.solve_image(frame_path, force_blind=(len(PA_ENGINE.points) == 0))
     if not solve.solved:
-        raise HTTPException(status_code=422, detail=solve.message or "ASTAP plate solve failed")
-
-    # Update stretched preview in /dev/shm
-    arr_rgb, _ = decode_cr3_preview_array(frame_path, max_dim=1200)
-    stretched = auto_stretch_rgb(arr_rgb, enable_stretch=True)
-    hist = compute_histogram_256(stretched)
-    preview_path = CONFIG.shm_dir / "latest_preview.jpg"
-    Image.fromarray(stretched).save(preview_path, format="JPEG", quality=82)
-    STATE.latest_preview.update(
-        {
-            "image_url": f"/api/camera/preview.jpg?t={int(time.time() * 1000)}",
-            "timestamp": time.time(),
-            "source_format": "Small Fine JPEG",
-            "histogram": hist,
-        }
-    )
+        star_hint = f" (detected {metrics['star_count']} stars in frame)"
+        raise HTTPException(
+            status_code=422,
+            detail=(solve.message or "ASTAP plate solve failed") + star_hint,
+        )
 
     obs = _current_observer()
     try:
@@ -128,9 +131,9 @@ async def capture_pa_calibration_point(payload: Dict[str, Any] = None) -> Dict[s
 
     pa_dict["last_solve_ms"] = solve.solve_time_ms
     pa_dict["loop_running"] = _pa_loop_task is not None and not _pa_loop_task.done()
+    pa_dict["solve_warning"] = None
     STATE.pa_state.update(pa_dict)
     await STATE.broadcast("PA_STATE", STATE.pa_state)
-    await STATE.broadcast("PREVIEW_UPDATED", STATE.latest_preview)
     return STATE.pa_state
 
 
@@ -138,7 +141,7 @@ async def capture_pa_calibration_point(payload: Dict[str, Any] = None) -> Dict[s
 async def execute_pa_live_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     """Execute one fast-solve iteration (~2.5s cycle) of the Live Wedge Adjustment phase."""
     body = payload or {}
-    exposure_s = float(body.get("exposure_s", 1.6))
+    exposure_s = float(body.get("exposure_s", 2.0))
     iso = str(body.get("iso", "1600"))
 
     if PA_ENGINE.camera_local_axis is None:
@@ -148,32 +151,39 @@ async def execute_pa_live_step(payload: Dict[str, Any] = None) -> Dict[str, Any]
         )
 
     frame_path = CONFIG.shm_dir / "pa_live.jpg"
-    await CAMERA.capture_frame(
-        output_path=frame_path,
-        exposure_s=exposure_s,
-        iso=iso,
-        fast_jpeg=True,
-        frame_type="Light",
-        mode="PA",
-    )
+    try:
+        await CAMERA.capture_frame(
+            output_path=frame_path,
+            exposure_s=exposure_s,
+            iso=iso,
+            fast_jpeg=True,
+            frame_type="Light",
+            mode="PA",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Camera capture failed: {exc}") from exc
+
     utc_ts = STATE.observer.current_utc_timestamp()
-    # Use seeded ASTAP search (-ra -spd -r 15) for ~0.2s solves!
+
+    # Publish live preview immediately so Live Sky Preview updates on every 2.5s loop tick
+    _, metrics = await process_and_publish_preview(
+        source_path=frame_path,
+        max_dim=1280,
+        compute_hfr=True,
+        jpeg_quality=82,
+        source_label="Small Fine JPEG (PA Live)",
+        max_overlay_stars=15,
+        meta={"exposure_s": exposure_s, "iso": iso, "mode": "PA Live"},
+        broadcast=True,
+    )
+
+    # Use seeded ASTAP search (-ra -spd -r 15) for ~0.2s solves, auto-falling back to blind if slewed
     solve = await ASTAP.solve_image(frame_path, force_blind=False)
     if not solve.solved:
-        raise HTTPException(status_code=422, detail=solve.message or "Live solve failed")
-
-    arr_rgb, _ = decode_cr3_preview_array(frame_path, max_dim=1200)
-    stretched = auto_stretch_rgb(arr_rgb, enable_stretch=True)
-    hist = compute_histogram_256(stretched)
-    Image.fromarray(stretched).save(CONFIG.shm_dir / "latest_preview.jpg", format="JPEG", quality=82)
-    STATE.latest_preview.update(
-        {
-            "image_url": f"/api/camera/preview.jpg?t={int(time.time() * 1000)}",
-            "timestamp": time.time(),
-            "source_format": "Small Fine JPEG",
-            "histogram": hist,
-        }
-    )
+        raise HTTPException(
+            status_code=422,
+            detail=f"{solve.message or 'Live solve failed'} ({metrics['star_count']} stars detected)",
+        )
 
     obs = _current_observer()
     pa_dict = PA_ENGINE.evaluate_live_frame(
@@ -185,6 +195,7 @@ async def execute_pa_live_step(payload: Dict[str, Any] = None) -> Dict[str, Any]
     )
     pa_dict["last_solve_ms"] = solve.solve_time_ms
     pa_dict["loop_running"] = _pa_loop_task is not None and not _pa_loop_task.done()
+    pa_dict["solve_warning"] = None
     STATE.pa_state.update(pa_dict)
     await STATE.broadcast("PA_STATE", STATE.pa_state)
     return STATE.pa_state
@@ -193,38 +204,64 @@ async def execute_pa_live_step(payload: Dict[str, Any] = None) -> Dict[str, Any]
 async def _continuous_pa_worker(exposure_s: float, iso: str) -> None:
     try:
         while not _pa_loop_stop.is_set():
-            if PA_ENGINE.camera_local_axis is None:
-                # In Hands-Free Auto-Advance calibration mode
-                frame_path = CONFIG.shm_dir / "pa_auto.jpg"
-                await CAMERA.capture_frame(
-                    output_path=frame_path,
-                    exposure_s=exposure_s,
-                    iso=iso,
-                    fast_jpeg=True,
-                    frame_type="Light",
-                    mode="PA",
-                )
-                utc_ts = STATE.observer.current_utc_timestamp()
-                solve = await ASTAP.solve_image(frame_path, force_blind=False)
-                if solve.solved:
-                    obs = _current_observer()
-                    locked, info = PA_ENGINE.check_auto_advance_frame(
-                        solve.ra_hours,
-                        solve.dec_deg,
-                        solve.crota2_deg,
-                        utc_ts,
-                        obs,
+            try:
+                if PA_ENGINE.camera_local_axis is None:
+                    # Hands-Free Auto-Advance calibration mode
+                    frame_path = CONFIG.shm_dir / "pa_auto.jpg"
+                    await CAMERA.capture_frame(
+                        output_path=frame_path,
+                        exposure_s=exposure_s,
+                        iso=iso,
+                        fast_jpeg=True,
+                        frame_type="Light",
+                        mode="PA",
                     )
-                    if locked:
-                        STATE.pa_state.update(info)
+                    utc_ts = STATE.observer.current_utc_timestamp()
+                    await process_and_publish_preview(
+                        source_path=frame_path,
+                        max_dim=1280,
+                        compute_hfr=True,
+                        jpeg_quality=82,
+                        source_label="Small Fine JPEG (PA Auto)",
+                        max_overlay_stars=15,
+                        broadcast=True,
+                    )
+                    solve = await ASTAP.solve_image(frame_path, force_blind=False)
+                    if solve.solved:
+                        obs = _current_observer()
+                        locked, info = PA_ENGINE.check_auto_advance_frame(
+                            solve.ra_hours,
+                            solve.dec_deg,
+                            solve.crota2_deg,
+                            utc_ts,
+                            obs,
+                        )
+                        if locked:
+                            STATE.pa_state.update(info)
+                        else:
+                            STATE.pa_state.update(PA_ENGINE.to_dict(obs))
+                            STATE.pa_state.update(info)
+                        STATE.pa_state["last_solve_ms"] = solve.solve_time_ms
+                        STATE.pa_state["loop_running"] = True
+                        STATE.pa_state["solve_warning"] = None
+                        await STATE.broadcast("PA_STATE", STATE.pa_state)
                     else:
-                        STATE.pa_state.update(PA_ENGINE.to_dict(obs))
-                        STATE.pa_state.update(info)
-                    STATE.pa_state["last_solve_ms"] = solve.solve_time_ms
-                    STATE.pa_state["loop_running"] = True
-                    await STATE.broadcast("PA_STATE", STATE.pa_state)
-            else:
-                await execute_pa_live_step({"exposure_s": exposure_s, "iso": iso})
+                        STATE.pa_state["solve_warning"] = "Motion blur / searching for stars — hold mount steady..."
+                        await STATE.broadcast("PA_STATE", STATE.pa_state)
+                else:
+                    await execute_pa_live_step({"exposure_s": exposure_s, "iso": iso})
+            except asyncio.CancelledError:
+                raise
+            except HTTPException as hexc:
+                # Expected when user turns wedge knobs mid-exposure (streaked stars); keep loop alive!
+                STATE.pa_state["solve_warning"] = f"Re-acquiring stars (hold steady after turning knob): {hexc.detail}"
+                STATE.pa_state["loop_running"] = True
+                await STATE.broadcast("PA_STATE", STATE.pa_state)
+            except Exception as exc:
+                STATE.pa_state["solve_warning"] = f"Transient frame error (retrying): {exc}"
+                STATE.pa_state["loop_running"] = True
+                await STATE.broadcast("PA_STATE", STATE.pa_state)
+
             await asyncio.sleep(0.35)
     except asyncio.CancelledError:
         pass
@@ -238,7 +275,7 @@ async def _continuous_pa_worker(exposure_s: float, iso: str) -> None:
 async def start_pa_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     global _pa_loop_task
     body = payload or {}
-    exposure_s = float(body.get("exposure_s", 1.6))
+    exposure_s = float(body.get("exposure_s", 2.0))
     iso = str(body.get("iso", "1600"))
 
     if _pa_loop_task is not None and not _pa_loop_task.done():
@@ -246,6 +283,7 @@ async def start_pa_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
     _pa_loop_stop.clear()
     STATE.pa_state["loop_running"] = True
+    STATE.pa_state["solve_warning"] = None
     _pa_loop_task = asyncio.create_task(_continuous_pa_worker(exposure_s, iso))
     await STATE.broadcast("PA_STATE", STATE.pa_state)
     return STATE.pa_state
@@ -265,6 +303,7 @@ async def stop_pa_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
             pass
     _pa_loop_task = None
     STATE.pa_state["loop_running"] = False
+    STATE.pa_state["solve_warning"] = None
     if restore_raw:
         await CAMERA.ensure_raw_format()
         if STATE.active_mode == "PA":

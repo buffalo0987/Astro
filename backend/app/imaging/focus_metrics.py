@@ -25,7 +25,11 @@ def compute_star_hfr_metrics(
     scale_arcsec = pixel_scale_arcsec or CONFIG.optics.pixel_scale_arcsec
 
     if arr.ndim == 3:
-        luma = (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]).astype(np.float32)
+        luma = (
+            np.float32(0.299) * arr[:, :, 0]
+            + np.float32(0.587) * arr[:, :, 1]
+            + np.float32(0.114) * arr[:, :, 2]
+        ).astype(np.float32, copy=False)
     else:
         luma = arr.astype(np.float32)
 

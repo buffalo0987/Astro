@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import glob
+import math
 import os
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from ..astrometry.coordinates import ObserverLocation
 from ..config import CONFIG
@@ -34,6 +36,61 @@ USBDEVFS_RESET = 21780  # 0x5514 (_IO('U', 20))
 CANON_VENDOR_ID = "04a9"
 
 
+def parse_canon_shutter_choice(choice: str) -> Optional[float]:
+    """Parse a Canon libgphoto2 shutter speed choice string into exact seconds.
+
+    Handles formats such as:
+      - Fractions: '1/4000', '1/1000', '1/4'
+      - Quote notation: '0\"5' (0.5s), '3\"2' (3.2s), '15\"' (15s)
+      - Standard numbers: '0.5', '1.6', '2', '30', '2.0s'
+    """
+    s = choice.strip().lower()
+    if not s or "bulb" in s or "auto" in s or "sync" in s:
+        return None
+    if s.endswith("s"):
+        s = s[:-1].strip()
+
+    if "/" in s:
+        parts = s.split("/", 1)
+        try:
+            num = float(parts[0].strip())
+            den = float(parts[1].strip())
+            if num > 0 and den > 0:
+                return num / den
+        except ValueError:
+            return None
+        return None
+
+    if '"' in s:
+        # e.g. '0"5' -> '0.5', '15"' -> '15'
+        q_parts = s.split('"', 1)
+        s = f"{q_parts[0]}.{q_parts[1]}" if q_parts[1].strip() else q_parts[0]
+
+    try:
+        val = float(s)
+        return val if val > 0 else None
+    except ValueError:
+        return None
+
+
+def select_best_canon_shutter_choice(choices: Sequence[str], exposure_s: float) -> Optional[str]:
+    """Select the closest physical Canon shutter speed choice using logarithmic stop distance."""
+    target = max(0.000125, float(exposure_s))
+    best_choice: Optional[str] = None
+    best_log_dist = float("inf")
+
+    for ch in choices:
+        sec = parse_canon_shutter_choice(ch)
+        if sec is None or sec <= 0:
+            continue
+        dist = abs(math.log(sec / target))
+        if dist < best_log_dist:
+            best_log_dist = dist
+            best_choice = ch
+
+    return best_choice
+
+
 class CameraController:
     """Single-daemon camera controller serialized through a 1-worker thread executor."""
 
@@ -42,6 +99,7 @@ class CameraController:
         "Small Fine JPEG",
         "S1 Fine",
         "Small Normal JPEG",
+        "S2",
         "Medium Fine JPEG",
         "M Fine",
         "Large Fine JPEG",
@@ -55,6 +113,46 @@ class CameraController:
         self._gp_context: Any = None
         self._raw_format_label: str = "RAW"
         self._fast_jpeg_label: str = "Small Fine JPEG"
+        self._pre_capture_hooks: List[Callable[[], Awaitable[None]]] = []
+
+    def register_pre_capture_hook(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Register an async hook invoked before any still/Bulb capture (e.g., stopping Live View)."""
+        if hook not in self._pre_capture_hooks:
+            self._pre_capture_hooks.append(hook)
+
+    async def _run_pre_capture_hooks(self) -> None:
+        for hook in list(self._pre_capture_hooks):
+            try:
+                await hook()
+            except Exception:
+                pass
+
+    # --- SWIG python-gphoto2 version-agnostic helpers ---
+    def _gp_get_config(self) -> Any:
+        try:
+            return self._gp_camera.get_config()
+        except TypeError:
+            return self._gp_camera.get_config(self._gp_context)
+
+    def _gp_set_config(self, cfg: Any) -> None:
+        try:
+            self._gp_camera.set_config(cfg)
+        except TypeError:
+            self._gp_camera.set_config(cfg, self._gp_context)
+
+    def _gp_wait_for_event(self, timeout_ms: int) -> tuple[Any, Any]:
+        try:
+            return self._gp_camera.wait_for_event(timeout_ms)
+        except TypeError:
+            return self._gp_camera.wait_for_event(timeout_ms, self._gp_context)
+
+    def _gp_exit(self) -> None:
+        if self._gp_camera is None:
+            return
+        try:
+            self._gp_camera.exit()
+        except TypeError:
+            self._gp_camera.exit(self._gp_context)
 
     async def initialize(self) -> Dict[str, Any]:
         """Connect to the physical Canon EOS M200 via libgphoto2 or activate simulator fallback."""
@@ -85,7 +183,7 @@ class CameraController:
 
         if self._gp_camera is not None:
             try:
-                self._gp_camera.exit(self._gp_context)
+                self._gp_exit()
             except Exception:
                 pass
             self._gp_camera = None
@@ -93,10 +191,15 @@ class CameraController:
         try:
             ctx = gp.Context()
             cam = gp.Camera()
-            cam.init(ctx)
+            try:
+                cam.init()
+            except TypeError:
+                cam.init(ctx)
             self._gp_context = ctx
             self._gp_camera = cam
             self._set_widget_sync("autopoweroff", ("0", "Off", "Disable"))
+            # Critical for cardless Canon EOS M200 operation: default to Internal RAM
+            self._set_widget_sync("capturetarget", ("Internal RAM", "RAM"))
             self._discover_format_labels_sync()
             self._set_image_format_sync(fast_jpeg=False)
 
@@ -117,23 +220,34 @@ class CameraController:
         if self._gp_camera is None or gp is None:
             return
         try:
-            try:
-                cfg = self._gp_camera.get_config()
-            except Exception:
-                cfg = self._gp_camera.get_config(self._gp_context)
+            cfg = self._gp_get_config()
             ok, widget = gp.gp_widget_get_child_by_name(cfg, "imageformat")
             if ok >= gp.GP_OK:
                 choices = [widget.get_choice(i) for i in range(widget.count_choices())]
+                found_raw = False
                 for cand in self.RAW_FORMAT_CANDIDATES:
                     for ch in choices:
-                        if cand.lower() == ch.lower() or "raw" in ch.lower():
+                        if cand.lower() == ch.lower():
+                            self._raw_format_label = ch
+                            found_raw = True
+                            break
+                    if found_raw:
+                        break
+                if not found_raw:
+                    for ch in choices:
+                        if "raw" in ch.lower() and "jpeg" not in ch.lower():
                             self._raw_format_label = ch
                             break
+
+                found_jpg = False
                 for cand in self.FAST_JPEG_CANDIDATES:
                     for ch in choices:
-                        if cand.lower() in ch.lower():
+                        if cand.lower() == ch.lower() or cand.lower() in ch.lower():
                             self._fast_jpeg_label = ch
+                            found_jpg = True
                             break
+                    if found_jpg:
+                        break
         except Exception:
             pass
 
@@ -141,50 +255,61 @@ class CameraController:
         if self._gp_camera is None or gp is None:
             return False
         try:
-            try:
-                cfg = self._gp_camera.get_config()
-            except Exception:
-                cfg = self._gp_camera.get_config(self._gp_context)
+            cfg = self._gp_get_config()
             ok, widget = gp.gp_widget_get_child_by_name(cfg, widget_name)
             if ok < gp.GP_OK:
                 return False
 
-            choices = []
+            choices: List[str] = []
             try:
                 choices = [widget.get_choice(i) for i in range(widget.count_choices())]
             except Exception:
                 pass
 
-            def _apply_cfg(c: Any) -> None:
-                try:
-                    self._gp_camera.set_config(c)
-                except Exception:
-                    self._gp_camera.set_config(c, self._gp_context)
-
             if choices:
+                # 1. Exact case-insensitive match
                 for cand in candidates:
+                    cand_low = cand.strip().lower()
                     for ch in choices:
-                        if cand.lower() == ch.lower() or cand == ch:
+                        if cand == ch or cand_low == ch.strip().lower():
                             widget.set_value(ch)
-                            _apply_cfg(cfg)
+                            self._gp_set_config(cfg)
                             return True
+                # 2. Safe substring match ONLY for descriptive labels (>= 3 chars, non-numeric)
                 for cand in candidates:
+                    cand_clean = cand.strip().lower()
+                    if len(cand_clean) < 3 or any(c.isdigit() for c in cand_clean) and "/" in cand_clean:
+                        continue
+                    if cand_clean.replace(".", "").isdigit():
+                        continue
                     for ch in choices:
-                        if cand in ch:
+                        if cand_clean in ch.lower():
                             widget.set_value(ch)
-                            _apply_cfg(cfg)
+                            self._gp_set_config(cfg)
                             return True
             else:
                 for val in candidates:
                     try:
                         widget.set_value(val)
-                        _apply_cfg(cfg)
+                        self._gp_set_config(cfg)
                         return True
                     except Exception:
                         continue
         except Exception:
             pass
         return False
+
+    def _exit_live_view_sync(self) -> None:
+        """Cleanly exit Canon EVF Live View mode so physical/Bulb shutter commands never return Busy."""
+        if self._gp_camera is None or gp is None:
+            return
+        self._set_widget_sync("viewfinder", ("0", "Off", "False"))
+        self._drain_events_sync(max_wait_ms=250)
+
+    async def exit_live_view(self) -> None:
+        if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self._exit_live_view_sync)
 
     def _set_iso_sync(self, iso: str) -> bool:
         STATE.camera.iso = str(iso)
@@ -199,15 +324,31 @@ class CameraController:
         return res
 
     def _set_shutter_speed_sync(self, exposure_s: float) -> bool:
-        if exposure_s <= 30.0:
-            STATE.camera.shutter_speed = f"{exposure_s:g}s"
-            cands = (str(exposure_s), f"{exposure_s:g}", f"{exposure_s:.1f}", str(int(round(exposure_s))))
+        if exposure_s > 30.0:
+            STATE.camera.shutter_speed = f"BULB ({exposure_s:g}s)"
             if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
-                return self._set_widget_sync("shutterspeed", cands)
-        else:
-            STATE.camera.shutter_speed = f"BULB ({exposure_s}s)"
-            if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
-                return self._set_widget_sync("shutterspeed", ("bulb", "Bulb"))
+                return self._set_widget_sync("shutterspeed", ("bulb", "Bulb", "BULB"))
+            return True
+
+        STATE.camera.shutter_speed = f"{exposure_s:g}s"
+        if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None and gp is not None:
+            try:
+                cfg = self._gp_get_config()
+                ok, widget = gp.gp_widget_get_child_by_name(cfg, "shutterspeed")
+                if ok >= gp.GP_OK:
+                    choices = [widget.get_choice(i) for i in range(widget.count_choices())]
+                    best_ch = select_best_canon_shutter_choice(choices, exposure_s)
+                    if best_ch is not None:
+                        widget.set_value(best_ch)
+                        self._gp_set_config(cfg)
+                        STATE.camera.shutter_speed = best_ch
+                        return True
+            except Exception:
+                pass
+            return self._set_widget_sync(
+                "shutterspeed",
+                (f"{exposure_s:g}", str(exposure_s), str(int(round(exposure_s)))),
+            )
         return True
 
     async def set_shutter_speed(self, exposure_s: float) -> bool:
@@ -221,9 +362,10 @@ class CameraController:
         if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
             if fast_jpeg:
                 self._set_widget_sync("imageformat", (self._fast_jpeg_label,) + self.FAST_JPEG_CANDIDATES)
-                self._set_widget_sync("capturetarget", ("Internal RAM", "RAM"))
             else:
                 self._set_widget_sync("imageformat", (self._raw_format_label,) + self.RAW_FORMAT_CANDIDATES)
+            # Always default capturetarget to Internal RAM so cardless EOS M200 never blocks
+            self._set_widget_sync("capturetarget", ("Internal RAM", "RAM"))
 
         if fast_jpeg:
             STATE.camera.image_format = "Small Fine JPEG"
@@ -255,9 +397,10 @@ class CameraController:
         try:
             if self._gp_camera is not None and gp is not None:
                 try:
-                    self._gp_camera.exit(self._gp_context)
+                    self._gp_exit()
                 except Exception:
                     pass
+                self._gp_camera = None
             # Search /sys/bus/usb/devices for Canon vendor ID 04a9
             for vendor_path in glob.glob("/sys/bus/usb/devices/*/idVendor"):
                 try:
@@ -288,11 +431,13 @@ class CameraController:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 self._executor,
-                self._set_widget_sync,
-                "eosremoterelease",
-                ("Release Full", "None", "Immediate Release"),
+                self._release_bulb_sync,
             )
         await self.ensure_raw_format()
+
+    def _release_bulb_sync(self) -> None:
+        self._set_widget_sync("eosremoterelease", ("Release Full", "Release 2", "Release 3"))
+        self._set_widget_sync("eosremoterelease", ("None",))
 
     async def capture_frame(
         self,
@@ -306,6 +451,9 @@ class CameraController:
         max_retries: int = 1,
     ) -> Path:
         """Execute a thread-safe camera exposure (<=30s native or >30s Bulb) with USB auto-retry."""
+        # Automatically pause/stop any active EVF Live Viewfinder loop before locking camera
+        await self._run_pre_capture_hooks()
+
         async with self._capture_lock:
             self._abort_event.clear()
             loop = asyncio.get_running_loop()
@@ -322,7 +470,7 @@ class CameraController:
                 await self.ensure_raw_format()
 
             STATE.camera.iso = str(iso)
-            STATE.camera.shutter_speed = f"{exposure_s}s" if exposure_s <= 30.0 else f"BULB ({exposure_s}s)"
+            STATE.camera.shutter_speed = f"{exposure_s:g}s" if exposure_s <= 30.0 else f"BULB ({exposure_s:g}s)"
             STATE.camera.busy = True
             STATE.camera.exposing = True
             STATE.camera.exposure_total_s = float(exposure_s)
@@ -358,7 +506,7 @@ class CameraController:
                                 await self.set_fast_jpeg_mode()
                             else:
                                 await self.ensure_raw_format()
-                raise RuntimeError(f"Capture failed after {max_retries} attempts: {last_exc}")
+                raise RuntimeError(f"Capture failed: {last_exc}")
             finally:
                 STATE.camera.busy = False
                 STATE.camera.exposing = False
@@ -380,22 +528,21 @@ class CameraController:
         loop = asyncio.get_running_loop()
 
         if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None and gp is not None:
-            # Configure ISO and capturetarget
+            # Ensure camera EVF viewfinder is closed before still or Bulb shutter actuation
+            await loop.run_in_executor(self._executor, self._exit_live_view_sync)
+
+            # Configure ISO and capturetarget (Internal RAM for cardless operation)
             await loop.run_in_executor(self._executor, self._set_widget_sync, "iso", (str(iso),))
             target_choices = ("Memory card", "SD Card") if keep_on_camera_sd else ("Internal RAM", "RAM")
             await loop.run_in_executor(self._executor, self._set_widget_sync, "capturetarget", target_choices)
 
             if exposure_s <= 30.0:
-                await loop.run_in_executor(
-                    self._executor,
-                    self._set_widget_sync,
-                    "shutterspeed",
-                    (str(exposure_s), f"{exposure_s:.1f}", str(int(round(exposure_s)))),
-                )
+                await loop.run_in_executor(self._executor, self._set_shutter_speed_sync, exposure_s)
                 capture_future = loop.run_in_executor(
                     self._executor,
                     self._gphoto_standard_capture_sync,
                     output_path,
+                    exposure_s,
                 )
                 t0 = time.monotonic()
                 while not capture_future.done():
@@ -410,14 +557,25 @@ class CameraController:
                 await capture_future
                 return
 
-            # Bulb Exposure (> 30s) via eosremoterelease
-            await loop.run_in_executor(self._executor, self._set_widget_sync, "shutterspeed", ("bulb", "Bulb"))
-            await loop.run_in_executor(
+            # Held Bulb Exposure (> 30s) via eosremoterelease ('Press Full' / 'Press 2' — NEVER 'Immediate'!)
+            bulb_ok = await loop.run_in_executor(self._executor, self._set_shutter_speed_sync, exposure_s)
+            if not bulb_ok:
+                raise RuntimeError(
+                    "Camera rejected Bulb mode (>30s). Ensure Canon EOS M200 dial is set to Manual (M) "
+                    "and Drive Mode is Single Shot."
+                )
+
+            press_ok = await loop.run_in_executor(
                 self._executor,
                 self._set_widget_sync,
                 "eosremoterelease",
-                ("Immediate", "Press Full", "Press 2"),
+                ("Press Full", "Press 2"),
             )
+            if not press_ok:
+                raise RuntimeError(
+                    "Failed to open Bulb shutter via eosremoterelease. Verify camera is in Manual (M) mode."
+                )
+
             t0 = time.monotonic()
             try:
                 while True:
@@ -432,17 +590,17 @@ class CameraController:
                     await STATE.broadcast("EXPOSURE_TICK", self.status_dict())
                     await asyncio.sleep(min(0.25, max(0.02, exposure_s - elapsed)))
             finally:
-                await loop.run_in_executor(
-                    self._executor,
-                    self._set_widget_sync,
-                    "eosremoterelease",
-                    ("Release Full", "None", "Immediate Release"),
-                )
+                await loop.run_in_executor(self._executor, self._release_bulb_sync)
 
-            await loop.run_in_executor(self._executor, self._gphoto_wait_file_added_sync, output_path)
+            await loop.run_in_executor(
+                self._executor,
+                self._gphoto_wait_file_added_sync,
+                output_path,
+                45.0,
+            )
             return
 
-        # Simulator path (caps simulated real-time wait at 0.35s for fast responsiveness unless testing ticks)
+        # Simulator path (caps simulated real-time wait at 0.30s for fast responsiveness)
         sim_wait = min(float(exposure_s), 0.30)
         t0 = time.monotonic()
         while True:
@@ -479,19 +637,18 @@ class CameraController:
             STATE.observer.current_utc_timestamp(),
         )
 
-    def capture_preview_frame_sync(self, output_path: Path) -> Path:
-        """Capture an instant viewfinder frame directly from Canon live-view stream without actuating the physical shutter."""
+    def capture_preview_bytes_sync(self) -> Optional[bytes]:
+        """Capture an instant EVF frame in memory without actuating the physical shutter."""
         if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None and gp is not None:
             try:
                 camera_file = self._gp_camera.capture_preview()
-            except (TypeError, Exception):
+            except TypeError:
                 camera_file = self._gp_camera.capture_preview(self._gp_context)
             file_data = camera_file.get_data_and_size()
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(bytes(file_data))
-            return output_path
+            return bytes(file_data)
 
-        # Simulator fallback: render synthetic frame fast
+        # Simulator fallback
+        tmp_path = CONFIG.shm_dir / "live_view.jpg"
         obs = ObserverLocation(
             latitude_deg=STATE.observer.latitude_deg,
             longitude_deg=STATE.observer.longitude_deg,
@@ -501,8 +658,8 @@ class CameraController:
             refraction_enabled=STATE.observer.refraction_enabled,
         )
         SIM_RIG.render_synthetic_frame(
-            output_path,
-            is_raw=False,
+            tmp_path,
+            is_raw_cr3=False,
             frame_type="Light",
             exposure_s=0.1,
             iso="800",
@@ -510,10 +667,26 @@ class CameraController:
             observer=obs,
             utc_timestamp=STATE.observer.current_utc_timestamp(),
         )
+        return tmp_path.read_bytes() if tmp_path.is_file() else None
+
+    def capture_preview_frame_sync(self, output_path: Path) -> Path:
+        data = self.capture_preview_bytes_sync()
+        if data:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(data)
         return output_path
 
+    async def capture_live_view_bytes(self) -> Optional[bytes]:
+        """Asynchronously grab one EVF preview frame in memory, skipping if shutter capture holds lock."""
+        if self._capture_lock.locked():
+            return None
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.capture_preview_bytes_sync)
+
     async def capture_live_view(self, output_path: Path) -> Path:
-        """Asynchronously stream a live viewfinder frame without tripping the shutter."""
+        """Asynchronously stream a live viewfinder frame to output_path without tripping the shutter."""
+        if self._capture_lock.locked():
+            return output_path
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor,
@@ -527,19 +700,23 @@ class CameraController:
         t_end = time.monotonic() + (max_wait_ms / 1000.0)
         while time.monotonic() < t_end:
             try:
-                ev_type, _ = self._gp_camera.wait_for_event(50, self._gp_context)
+                ev_type, _ = self._gp_wait_for_event(50)
                 if ev_type == gp.GP_EVENT_TIMEOUT:
                     break
             except Exception:
                 break
 
-    def _gphoto_standard_capture_sync(self, output_path: Path) -> None:
-        # Drain any lingering live view frames from the camera's USB FIFO buffer
-        self._drain_events_sync(max_wait_ms=300)
+    def _gphoto_standard_capture_sync(self, output_path: Path, exposure_s: float = 2.0) -> None:
+        # Drain any lingering live view events from the camera's USB FIFO buffer
+        self._drain_events_sync(max_wait_ms=250)
 
         direct_exc = None
         try:
-            file_path = self._gp_camera.capture(gp.GP_CAPTURE_IMAGE)
+            try:
+                file_path = self._gp_camera.capture(gp.GP_CAPTURE_IMAGE)
+            except TypeError:
+                file_path = self._gp_camera.capture(gp.GP_CAPTURE_IMAGE, self._gp_context)
+
             camera_file = self._gp_camera.file_get(
                 file_path.folder,
                 file_path.name,
@@ -556,10 +733,10 @@ class CameraController:
             direct_exc = exc
 
         # Event-driven wait fallback for Canon cameras (handles asynchronous PTP buffer flush)
-        deadline = time.monotonic() + 15.0
+        deadline = time.monotonic() + max(25.0, float(exposure_s) + 20.0)
         while time.monotonic() < deadline:
             try:
-                ev_type, ev_data = self._gp_camera.wait_for_event(500, self._gp_context)
+                ev_type, ev_data = self._gp_wait_for_event(500)
             except Exception:
                 break
             if ev_type == gp.GP_EVENT_FILE_ADDED:
@@ -579,10 +756,10 @@ class CameraController:
             raise direct_exc
         raise TimeoutError("Timed out waiting for image capture from Canon EOS M200")
 
-    def _gphoto_wait_file_added_sync(self, output_path: Path) -> None:
-        deadline = time.monotonic() + 15.0
+    def _gphoto_wait_file_added_sync(self, output_path: Path, timeout_s: float = 45.0) -> None:
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            ev_type, ev_data = self._gp_camera.wait_for_event(500, self._gp_context)
+            ev_type, ev_data = self._gp_wait_for_event(500)
             if ev_type == gp.GP_EVENT_FILE_ADDED:
                 camera_file = self._gp_camera.file_get(
                     ev_data.folder,
@@ -596,10 +773,12 @@ class CameraController:
                 except Exception:
                     pass
                 return
-        raise TimeoutError("Timed out waiting for GP_EVENT_FILE_ADDED after Bulb release")
+        raise TimeoutError(
+            "Timed out waiting for image file after Bulb release. "
+            "Check that In-Camera Long Exposure Noise Reduction is set to OFF."
+        )
 
     def status_dict(self) -> Dict[str, Any]:
-        from dataclasses import asdict
         return asdict(STATE.camera)
 
 

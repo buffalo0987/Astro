@@ -23,6 +23,11 @@ from app.astrometry.coordinates import (  # noqa: E402
 )
 from app.astrometry.framing import compute_framing_guidance  # noqa: E402
 from app.astrometry.polar_align import PolarAlignEngine  # noqa: E402
+from app.config import CONFIG  # noqa: E402
+from app.hardware.camera_actor import (  # noqa: E402
+    parse_canon_shutter_choice,
+    select_best_canon_shutter_choice,
+)
 from app.hardware.simulated_camera import SIM_RIG  # noqa: E402
 from app.imaging.cr3_parser import (  # noqa: E402
     build_synthetic_cr3_bytes,
@@ -296,6 +301,64 @@ class TestAstroPiSuite(unittest.TestCase):
         self.assertEqual(ca_resp.status_code, 200)
         self.assertIn(b"BEGIN CERTIFICATE", ca_resp.content)
         self.assertEqual(ca_resp.headers.get("content-type"), "application/x-x509-ca-cert")
+
+    def test_07_canon_shutter_matching_preview_stretch_and_pre_capture_hooks(self) -> None:
+        """Verify Canon shutter choice log-stop matching, cached stretch toggle, and EVF pre-capture hooks."""
+        canon_choices = [
+            "bulb", "30", "25", "20", "15", "13", "10", "8", "6", "5", "4",
+            '3"2', "2.5", "2", "1.6", "1.3", "1", "0.8", "0.6", '0"5', "0.4", "0.3",
+            "1/4", "1/8", "1/15", "1/30", "1/60", "1/125", "1/250", "1/500",
+            "1/1000", "1/2000", "1/4000",
+        ]
+        self.assertAlmostEqual(parse_canon_shutter_choice("1/1000") or 0.0, 0.001, places=6)
+        self.assertAlmostEqual(parse_canon_shutter_choice('0"5') or 0.0, 0.5, places=6)
+        self.assertAlmostEqual(parse_canon_shutter_choice('3"2') or 0.0, 3.2, places=6)
+        self.assertIsNone(parse_canon_shutter_choice("bulb"))
+
+        # Bias frame (0.001s) must select 1/1000, NEVER substring-match "30"!
+        self.assertEqual(select_best_canon_shutter_choice(canon_choices, 0.001), "1/1000")
+        self.assertEqual(select_best_canon_shutter_choice(canon_choices, 0.0002), "1/4000")
+        self.assertEqual(select_best_canon_shutter_choice(canon_choices, 0.5), '0"5')
+        self.assertEqual(select_best_canon_shutter_choice(canon_choices, 1.5), "1.6")
+        self.assertEqual(select_best_canon_shutter_choice(canon_choices, 30.0), "30")
+
+        # Preview endpoint returns 404 without firing shutter when no preview exists
+        preview_file = CONFIG.shm_dir / "latest_preview.jpg"
+        if preview_file.exists():
+            preview_file.unlink()
+        r_missing = self.client.get("/api/camera/preview.jpg")
+        self.assertEqual(r_missing.status_code, 404)
+
+        # Capture a preview shot and verify stretch toggle re-renders from cached source
+        r_shot = self.client.post("/api/camera/capture", json={"exposure_s": 1.0, "iso": "1600", "fast_jpeg": True})
+        self.assertEqual(r_shot.status_code, 200)
+        self.assertEqual(self.client.get("/api/camera/preview.jpg").status_code, 200)
+
+        r_unstretch = self.client.post("/api/camera/preview-stretch", json={"enabled": False})
+        self.assertEqual(r_unstretch.status_code, 200)
+        self.assertFalse(r_unstretch.json()["auto_stretched"])
+        self.assertFalse(self.client.get("/api/system/state").json()["preview"]["auto_stretched"])
+
+        r_restretch = self.client.post("/api/camera/preview-stretch", json={})
+        self.assertEqual(r_restretch.status_code, 200)
+        self.assertTrue(r_restretch.json()["auto_stretched"])
+        self.assertTrue(self.client.get("/api/system/state").json()["preview"]["auto_stretched"])
+
+        # Pre-capture hook: starting Live Viewfinder then triggering Framing Solve auto-stops Live Viewfinder
+        r_lv = self.client.post("/api/camera/live-loop/start", json={"exposure_s": 0.5, "iso": "1600"})
+        self.assertEqual(r_lv.status_code, 200)
+        self.assertTrue(self.client.get("/api/camera/status").json()["live_view_running"])
+
+        r_solve = self.client.post("/api/framing/solve", json={"exposure_s": 1.0, "iso": "1600"})
+        self.assertEqual(r_solve.status_code, 200)
+        st_after = self.client.get("/api/camera/status").json()
+        self.assertFalse(st_after["live_view_running"])
+        self.assertEqual(st_after["image_format"], "RAW (.CR3)")
+
+        # Catalog endpoint returns full seeded deep-sky list cleanly
+        r_cat = self.client.get("/api/framing/catalog")
+        self.assertEqual(r_cat.status_code, 200)
+        self.assertGreaterEqual(len(r_cat.json()["items"]), 100)
 
 
 if __name__ == "__main__":

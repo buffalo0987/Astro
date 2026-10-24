@@ -39,31 +39,8 @@ pkill -f gvfs-gphoto2-volume-monitor 2>/dev/null || true
 cp "${REPO_ROOT}/deploy/udev/99-astropi-gphoto2.rules" /etc/udev/rules.d/99-astropi-gphoto2.rules
 udevadm control --reload-rules && udevadm trigger
 
-echo "[3/7] Provisioning ASTAP CLI and W08 + D20 star databases in ${ASTAP_DIR}..."
-mkdir -p "${ASTAP_DIR}"
-ARCH="$(uname -m)"
-if ! command -v astap_cli >/dev/null 2>&1; then
-  if [[ "${ARCH}" == "aarch64" || "${ARCH}" == "arm64" ]]; then
-    echo "  -> Downloading and installing astap-cli ARM64 package..."
-    curl -fsSL -o /tmp/astap-cli_arm64.deb https://www.hnsky.org/astap-cli_arm64.deb 2>/dev/null || true
-    if [[ -f /tmp/astap-cli_arm64.deb ]]; then
-      dpkg -i /tmp/astap-cli_arm64.deb 2>/dev/null || apt-get install -f -y -qq
-      rm -f /tmp/astap-cli_arm64.deb
-    fi
-  else
-    echo "  -> Note: On non-ARM64 platforms, ensure astap_cli is in your PATH."
-  fi
-fi
-
-# Download W08 wide-field star database (~4MB, ideal for 180mm f/4.5 FOV)
-if [[ ! -f "${ASTAP_DIR}/w08.290" && ! -f "/opt/astap/w08.290" && ! -f "/usr/share/astap/w08.290" ]]; then
-  echo "  -> Downloading W08 wide-field star database (~4.2MB)..."
-  curl -fsSL -o /tmp/w08_star_database.deb https://www.hnsky.org/w08_star_database.deb 2>/dev/null || true
-  if [[ -f /tmp/w08_star_database.deb ]]; then
-    dpkg -i /tmp/w08_star_database.deb 2>/dev/null || apt-get install -f -y -qq
-    rm -f /tmp/w08_star_database.deb
-  fi
-fi
+echo "[3/7] Provisioning ASTAP CLI and G05 (3°–20° FOV) star database in ${ASTAP_DIR}..."
+bash "${REPO_ROOT}/deploy/ensure_astap.sh"
 
 echo "[4/7] Deploying AstroPi application to ${INSTALL_ROOT} and creating Python venv..."
 mkdir -p "${INSTALL_ROOT}" "${DATA_DIR}/captures" "/dev/shm/astropi"

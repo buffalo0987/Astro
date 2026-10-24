@@ -6,8 +6,6 @@ import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
-from PIL import Image
-
 from ..astrometry.astap_runner import ASTAP
 from ..astrometry.coordinates import ObserverLocation
 from ..astrometry.framing import compute_framing_guidance
@@ -15,11 +13,10 @@ from ..catalog.seed_catalog import import_telescopius_csv, parse_sexagesimal_or_
 from ..config import CONFIG
 from ..hardware.camera_actor import CAMERA
 from ..hardware.simulated_camera import SIM_RIG
-from ..imaging.cr3_parser import decode_cr3_preview_array
-from ..imaging.focus_metrics import compute_star_hfr_metrics
-from ..imaging.stretch import auto_stretch_rgb, compute_histogram_256
+from ..imaging.pipeline import process_and_publish_preview
 from ..state import STATE
 from ..web_compat import APIRouter, HTTPException
+from .routes_pa import stop_pa_live_loop
 
 router = APIRouter(prefix="/api/framing", tags=["framing_focus"])
 
@@ -46,7 +43,8 @@ async def list_dso_catalog(
     tpo180_only: bool = False,
 ) -> Dict[str, Any]:
     obs = _current_observer()
-    items = query_catalog(
+    items = await asyncio.to_thread(
+        query_catalog,
         observer=obs,
         utc_timestamp=STATE.observer.current_utc_timestamp(),
         search=search,
@@ -75,16 +73,22 @@ async def select_framing_target(payload: Dict[str, Any] = None) -> Dict[str, Any
     ra_raw = body.get("target_ra_hours", body.get("ra", 20.988))
     dec_raw = body.get("target_dec_deg", body.get("dec", 44.33))
 
-    ra_hours = (
-        parse_sexagesimal_or_decimal(str(ra_raw), is_ra=True)
-        if isinstance(ra_raw, str)
-        else float(ra_raw)
-    )
-    dec_deg = (
-        parse_sexagesimal_or_decimal(str(dec_raw), is_ra=False)
-        if isinstance(dec_raw, str)
-        else float(dec_raw)
-    )
+    try:
+        ra_hours = (
+            parse_sexagesimal_or_decimal(str(ra_raw), is_ra=True)
+            if isinstance(ra_raw, str)
+            else float(ra_raw)
+        )
+        dec_deg = (
+            parse_sexagesimal_or_decimal(str(dec_raw), is_ra=False)
+            if isinstance(dec_raw, str)
+            else float(dec_raw)
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid RA/Dec coordinates ({exc}). Use HH:MM:SS / +DD:MM:SS or decimal.",
+        ) from exc
 
     STATE.framing_state.update(
         {
@@ -119,6 +123,11 @@ async def capture_and_solve_framing(payload: Dict[str, Any] = None) -> Dict[str,
     iso = str(body.get("iso", "1600"))
     restore_raw = bool(body.get("restore_raw", True))
 
+    # Ensure background PA or Focus loops are stopped before framing solve
+    await stop_pa_live_loop({"restore_raw": False})
+    if STATE.focus_state.get("loop_running"):
+        await stop_focus_loop()
+
     if "sim_nudge_ra_hours" in body or "sim_nudge_dec_deg" in body:
         SIM_RIG.nudge_framing(
             float(body.get("sim_nudge_ra_hours", 0.0)),
@@ -132,34 +141,38 @@ async def capture_and_solve_framing(payload: Dict[str, Any] = None) -> Dict[str,
     STATE.active_mode = "FRAME"
     frame_path = CONFIG.shm_dir / "framing_solve.jpg"
     try:
-        await CAMERA.capture_frame(
-            output_path=frame_path,
-            exposure_s=exposure_s,
-            iso=iso,
-            fast_jpeg=True,
-            frame_type="Light",
-            mode="FRAME",
-        )
+        try:
+            await CAMERA.capture_frame(
+                output_path=frame_path,
+                exposure_s=exposure_s,
+                iso=iso,
+                fast_jpeg=True,
+                frame_type="Light",
+                mode="FRAME",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Camera capture failed: {exc}") from exc
+
         utc_ts = STATE.observer.current_utc_timestamp()
+
+        # Publish stretched preview FIRST so user sees the sky frame even if plate solve fails
+        _, metrics = await process_and_publish_preview(
+            source_path=frame_path,
+            max_dim=1400,
+            compute_hfr=True,
+            jpeg_quality=85,
+            source_label="Small Fine JPEG (Framing)",
+            max_overlay_stars=20,
+            meta={"exposure_s": exposure_s, "iso": iso, "mode": "FRAME"},
+            broadcast=True,
+        )
+
         solve = await ASTAP.solve_image(frame_path, force_blind=False)
         if not solve.solved:
-            raise HTTPException(status_code=422, detail=solve.message or "Framing plate solve failed")
-
-        arr_rgb, _ = decode_cr3_preview_array(frame_path, max_dim=1400)
-        stretched = auto_stretch_rgb(arr_rgb, enable_stretch=True)
-        hist = compute_histogram_256(stretched)
-        metrics = compute_star_hfr_metrics(arr_rgb)
-        Image.fromarray(stretched).save(CONFIG.shm_dir / "latest_preview.jpg", format="JPEG", quality=85)
-
-        STATE.latest_preview.update(
-            {
-                "image_url": f"/api/camera/preview.jpg?t={int(time.time() * 1000)}",
-                "timestamp": time.time(),
-                "source_format": "Small Fine JPEG",
-                "histogram": hist,
-                "stars_overlay": metrics["stars"][:20],
-            }
-        )
+            raise HTTPException(
+                status_code=422,
+                detail=f"{solve.message or 'Framing plate solve failed'} (detected {metrics['star_count']} stars)",
+            )
 
         guidance = compute_framing_guidance(
             current_ra_hours=solve.ra_hours,
@@ -173,7 +186,6 @@ async def capture_and_solve_framing(payload: Dict[str, Any] = None) -> Dict[str,
         guidance["solve_time_ms"] = solve.solve_time_ms
         STATE.framing_state.update(guidance)
         await STATE.broadcast("FRAMING_STATE", STATE.framing_state)
-        await STATE.broadcast("PREVIEW_UPDATED", STATE.latest_preview)
         return STATE.framing_state
     finally:
         if restore_raw:
@@ -205,7 +217,7 @@ async def set_focus_roi(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     """Capture a fast focus frame, compute full-field or 1:1 ROI HFR/FWHM, and append V-curve history."""
     body = payload or {}
-    exposure_s = float(body.get("exposure_s", 1.5))
+    exposure_s = float(body.get("exposure_s", 1.6))
     iso = str(body.get("iso", "1600"))
     restore_raw = bool(body.get("restore_raw", not STATE.focus_state.get("loop_running", False)))
 
@@ -217,14 +229,18 @@ async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     STATE.active_mode = "FOCUS"
     frame_path = CONFIG.shm_dir / "focus_frame.jpg"
     try:
-        await CAMERA.capture_frame(
-            output_path=frame_path,
-            exposure_s=exposure_s,
-            iso=iso,
-            fast_jpeg=True,
-            frame_type="Light",
-            mode="FOCUS",
-        )
+        try:
+            await CAMERA.capture_frame(
+                output_path=frame_path,
+                exposure_s=exposure_s,
+                iso=iso,
+                fast_jpeg=True,
+                frame_type="Light",
+                mode="FOCUS",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Camera capture failed: {exc}") from exc
+
         roi_cfg = STATE.focus_state.get("roi")
         roi_tuple = (
             (float(roi_cfg["x"]), float(roi_cfg["y"]), float(roi_cfg.get("size", 240)))
@@ -232,12 +248,17 @@ async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
             else None
         )
 
-        arr_rgb, _ = decode_cr3_preview_array(frame_path, max_dim=1400, roi_norm=roi_tuple)
-        stretched = auto_stretch_rgb(arr_rgb, enable_stretch=True)
-        hist = compute_histogram_256(stretched)
-        metrics = compute_star_hfr_metrics(arr_rgb)
-
-        Image.fromarray(stretched).save(CONFIG.shm_dir / "latest_preview.jpg", format="JPEG", quality=85)
+        _, metrics = await process_and_publish_preview(
+            source_path=frame_path,
+            max_dim=1400,
+            compute_hfr=True,
+            roi_norm=roi_tuple,
+            jpeg_quality=85,
+            source_label="1:1 ROI JPEG" if roi_tuple else "Small Fine JPEG (Focus)",
+            max_overlay_stars=20,
+            meta={"exposure_s": exposure_s, "iso": iso, "mode": "FOCUS"},
+            broadcast=False,
+        )
 
         hfr = float(metrics["hfr_median"])
         fwhm = float(metrics["fwhm_arcsec"])
@@ -268,15 +289,6 @@ async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
                 "history": history,
             }
         )
-        STATE.latest_preview.update(
-            {
-                "image_url": f"/api/camera/preview.jpg?t={int(time.time() * 1000)}",
-                "timestamp": time.time(),
-                "source_format": "1:1 ROI JPEG" if roi_tuple else "Small Fine JPEG",
-                "histogram": hist,
-                "stars_overlay": metrics["stars"][:20],
-            }
-        )
         await STATE.broadcast("FOCUS_METRICS", STATE.focus_state)
         await STATE.broadcast("PREVIEW_UPDATED", STATE.latest_preview)
         return STATE.focus_state
@@ -290,7 +302,13 @@ async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 async def _focus_loop_worker(exposure_s: float, iso: str) -> None:
     try:
         while not _focus_loop_stop.is_set():
-            await capture_focus_step({"exposure_s": exposure_s, "iso": iso, "restore_raw": False})
+            try:
+                await capture_focus_step({"exposure_s": exposure_s, "iso": iso, "restore_raw": False})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                STATE.camera.last_error = f"Focus loop retry: {exc}"
+                await STATE.broadcast("CAMERA_STATUS", CAMERA.status_dict())
             await asyncio.sleep(0.30)
     except asyncio.CancelledError:
         pass
@@ -306,8 +324,9 @@ async def _focus_loop_worker(exposure_s: float, iso: str) -> None:
 async def start_focus_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     global _focus_loop_task
     body = payload or {}
-    exposure_s = float(body.get("exposure_s", 1.5))
+    exposure_s = float(body.get("exposure_s", 1.6))
     iso = str(body.get("iso", "1600"))
+    await stop_pa_live_loop({"restore_raw": False})
     if _focus_loop_task is not None and not _focus_loop_task.done():
         return STATE.focus_state
     _focus_loop_stop.clear()

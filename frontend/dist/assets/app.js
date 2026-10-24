@@ -38,7 +38,24 @@
     catalogLoading: false,
     manualExposure: '2',
     manualIso: '1600',
+    notice: null,
+    busyAction: null,
   };
+
+  let noticeTimer = null;
+  function showNotice(message, level = 'err', autoHideMs = 10000) {
+    store.notice = { message, level };
+    if (level === 'err') playTone(310, 140, 'sawtooth');
+    else if (level === 'ok') playTone(740, 100, 'sine');
+    if (noticeTimer) clearTimeout(noticeTimer);
+    if (autoHideMs > 0) {
+      noticeTimer = setTimeout(() => {
+        store.notice = null;
+        render();
+      }, autoHideMs);
+    }
+    render();
+  }
 
   // Web Audio Cues for Dark-Sky Eyes-Free Operation
   let audioCtx = null;
@@ -200,6 +217,9 @@
   async function refreshAll() {
     try {
       store.state = await api('/api/system/state');
+      if (store.state?.camera && typeof store.state.camera.live_view_running === 'boolean') {
+        store.liveLoopRunning = store.state.camera.live_view_running;
+      }
     } catch (err) {
       console.warn('Failed to fetch system state:', err);
     }
@@ -262,6 +282,9 @@
         const msg = JSON.parse(ev.data);
         if (msg.type === 'STATE_SNAPSHOT' || msg.type === 'FRAME_SAVED') {
           store.state = msg.payload;
+          if (msg.payload?.camera && typeof msg.payload.camera.live_view_running === 'boolean') {
+            store.liveLoopRunning = msg.payload.camera.live_view_running;
+          }
           render();
         } else if (store.state) {
           if (msg.type === 'PREVIEW_UPDATED') {
@@ -274,6 +297,11 @@
             const srcFmt = document.getElementById('preview-source-fmt');
             if (srcFmt && msg.payload?.source_format) {
               srcFmt.textContent = `(${msg.payload.source_format})`;
+            }
+            const stretchBtn = document.getElementById('btn-toggle-stretch');
+            if (stretchBtn && typeof msg.payload?.auto_stretched === 'boolean') {
+              stretchBtn.textContent = msg.payload.auto_stretched ? '✨ Stretch: ON' : 'Stretch: OFF';
+              stretchBtn.classList.toggle('btn-active', msg.payload.auto_stretched);
             }
             return;
           }
@@ -295,6 +323,9 @@
           }
           if (msg.type === 'CAMERA_STATUS') {
             store.state.camera = msg.payload;
+            if (typeof msg.payload.live_view_running === 'boolean') {
+              store.liveLoopRunning = msg.payload.live_view_running;
+            }
           } else if (msg.type === 'PA_STATE') {
             if ((msg.payload.points || []).length > (store.state.pa.points || []).length) {
               playTone(660, 140, 'triangle');
@@ -317,12 +348,114 @@
     };
   }
 
+  let cachedPreviewUrl = null;
+  let cachedPreviewImg = null;
+  let loadingPreviewUrl = null;
+
+  function drawPreviewFromImage(canvas, ctx, img, preview) {
+    ctx.save();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const imgW = img.naturalWidth || canvas.width;
+    const imgH = img.naturalHeight || canvas.height;
+
+    let cropX = 0;
+    let cropY = 0;
+    let cropW = imgW;
+    let cropH = imgH;
+
+    if (store.zoom > 1.0) {
+      cropW = imgW / store.zoom;
+      cropH = imgH / store.zoom;
+      const hw = cropW / 2;
+      const hh = cropH / 2;
+
+      const centerX = Math.max(hw, Math.min(imgW - hw, store.panX * imgW));
+      const centerY = Math.max(hh, Math.min(imgH - hh, store.panY * imgH));
+
+      cropX = centerX - hw;
+      cropY = centerY - hh;
+
+      ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
+    } else {
+      ctx.drawImage(img, 0, 0, imgW, imgH, 0, 0, canvas.width, canvas.height);
+    }
+    ctx.restore();
+
+    if (store.nightVision) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.fillStyle = '#ff1a1a';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    }
+
+    // Draw star overlays mapped into current zoom & pan window
+    const stars = preview.stars_overlay || [];
+    ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#22d3ee';
+    ctx.fillStyle = store.nightVision ? '#ff1a1a' : '#22d3ee';
+    ctx.lineWidth = 1.5;
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'left';
+    for (const s of stars) {
+      let destX, destY;
+      if (store.zoom > 1.0) {
+        const starImgX = s.x * imgW;
+        const starImgY = s.y * imgH;
+        if (starImgX < cropX || starImgX > cropX + cropW || starImgY < cropY || starImgY > cropY + cropH) {
+          continue;
+        }
+        destX = ((starImgX - cropX) / cropW) * canvas.width;
+        destY = ((starImgY - cropY) / cropH) * canvas.height;
+      } else {
+        destX = s.x * canvas.width;
+        destY = s.y * canvas.height;
+      }
+      ctx.beginPath();
+      ctx.arc(destX, destY, Math.max(6, s.hfr * 3 * store.zoom), 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillText(`${s.hfr.toFixed(1)}px`, destX + 8, destY - 6);
+    }
+
+    // If zoomed, draw pan hint and overview mini-map
+    if (store.zoom > 1.0) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+      ctx.fillRect(8, 8, 175, 26);
+      ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#27272a';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(8, 8, 175, 26);
+      ctx.fillStyle = store.nightVision ? '#ff1a1a' : '#38bdf8';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(`🔍 ${store.zoom}x Zoom • Drag to Pan`, 14, 25);
+
+      const mmW = 60;
+      const mmH = 40;
+      const mmX = canvas.width - mmW - 10;
+      const mmY = 10;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+      ctx.fillRect(mmX, mmY, mmW, mmH);
+      ctx.strokeStyle = store.nightVision ? '#550000' : 'rgba(255, 255, 255, 0.35)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(mmX, mmY, mmW, mmH);
+
+      const vpW = mmW / store.zoom;
+      const vpH = mmH / store.zoom;
+      const vpX = mmX + (cropX / imgW) * mmW;
+      const vpY = mmY + (cropY / imgH) * mmH;
+      ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#ef4444';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(vpX, vpY, vpW, vpH);
+    }
+  }
+
   function renderPreviewCanvas() {
     const canvas = document.getElementById('sky-canvas');
     if (!canvas) return;
     const preview = store.state?.preview;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+
+    initCanvasPan();
 
     if (!preview?.image_url) {
       ctx.fillStyle = '#0a0a0c';
@@ -334,110 +467,39 @@
       return;
     }
 
+    // Synchronous 0ms repaint if image is already decoded (eliminates flicker & enables 60 FPS pan!)
+    if (cachedPreviewImg && cachedPreviewUrl === preview.image_url) {
+      drawPreviewFromImage(canvas, ctx, cachedPreviewImg, preview);
+      return;
+    }
+
+    // Keep displaying previous frame seamlessly while the new frame loads
+    if (cachedPreviewImg) {
+      drawPreviewFromImage(canvas, ctx, cachedPreviewImg, preview);
+    }
+
+    if (loadingPreviewUrl === preview.image_url) {
+      return;
+    }
+    loadingPreviewUrl = preview.image_url;
+
     const img = new Image();
     img.onload = () => {
-      ctx.save();
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const imgW = img.naturalWidth || canvas.width;
-      const imgH = img.naturalHeight || canvas.height;
-
-      let cropX = 0;
-      let cropY = 0;
-      let cropW = imgW;
-      let cropH = imgH;
-
-      if (store.zoom > 1.0) {
-        cropW = imgW / store.zoom;
-        cropH = imgH / store.zoom;
-        const hw = cropW / 2;
-        const hh = cropH / 2;
-
-        const centerX = Math.max(hw, Math.min(imgW - hw, store.panX * imgW));
-        const centerY = Math.max(hh, Math.min(imgH - hh, store.panY * imgH));
-
-        cropX = centerX - hw;
-        cropY = centerY - hh;
-
-        ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
-      } else {
-        ctx.drawImage(img, 0, 0, imgW, imgH, 0, 0, canvas.width, canvas.height);
-      }
-      ctx.restore();
-
-      if (store.nightVision) {
-        const idata = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const d = idata.data;
-        for (let i = 0; i < d.length; i += 4) {
-          const luma = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-          d[i] = luma;
-          d[i + 1] = 0;
-          d[i + 2] = 0;
+      cachedPreviewUrl = preview.image_url;
+      cachedPreviewImg = img;
+      loadingPreviewUrl = null;
+      const liveCanvas = document.getElementById('sky-canvas');
+      if (liveCanvas) {
+        const liveCtx = liveCanvas.getContext('2d');
+        if (liveCtx && store.state?.preview) {
+          drawPreviewFromImage(liveCanvas, liveCtx, img, store.state.preview);
         }
-        ctx.putImageData(idata, 0, 0);
-      }
-
-      // Draw star overlays mapped into current zoom & pan window
-      const stars = preview.stars_overlay || [];
-      ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#22d3ee';
-      ctx.fillStyle = store.nightVision ? '#ff1a1a' : '#22d3ee';
-      ctx.lineWidth = 1.5;
-      ctx.font = '12px monospace';
-      for (const s of stars) {
-        let destX, destY;
-        if (store.zoom > 1.0) {
-          const starImgX = s.x * imgW;
-          const starImgY = s.y * imgH;
-          if (starImgX < cropX || starImgX > cropX + cropW || starImgY < cropY || starImgY > cropY + cropH) {
-            continue;
-          }
-          destX = ((starImgX - cropX) / cropW) * canvas.width;
-          destY = ((starImgY - cropY) / cropH) * canvas.height;
-        } else {
-          destX = s.x * canvas.width;
-          destY = s.y * canvas.height;
-        }
-        ctx.beginPath();
-        ctx.arc(destX, destY, Math.max(6, s.hfr * 3 * store.zoom), 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.fillText(`${s.hfr.toFixed(1)}px`, destX + 8, destY - 6);
-      }
-
-      // If zoomed, draw pan hint and overview mini-map
-      if (store.zoom > 1.0) {
-        // Top-left hint pill
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-        ctx.fillRect(8, 8, 175, 26);
-        ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#27272a';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(8, 8, 175, 26);
-        ctx.fillStyle = store.nightVision ? '#ff1a1a' : '#38bdf8';
-        ctx.font = 'bold 11px sans-serif';
-        ctx.textAlign = 'left';
-        ctx.fillText(`🔍 ${store.zoom}x Zoom • Drag to Pan`, 14, 25);
-
-        // Top-right sensor mini-map
-        const mmW = 60;
-        const mmH = 40;
-        const mmX = canvas.width - mmW - 10;
-        const mmY = 10;
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
-        ctx.fillRect(mmX, mmY, mmW, mmH);
-        ctx.strokeStyle = store.nightVision ? '#550000' : 'rgba(255, 255, 255, 0.35)';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(mmX, mmY, mmW, mmH);
-
-        // Viewport bounding box inside mini-map
-        const vpW = mmW / store.zoom;
-        const vpH = mmH / store.zoom;
-        const vpX = mmX + (cropX / imgW) * mmW;
-        const vpY = mmY + (cropY / imgH) * mmH;
-        ctx.strokeStyle = store.nightVision ? '#ff1a1a' : '#ef4444';
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(vpX, vpY, vpW, vpH);
       }
     };
+    img.onerror = () => {
+      loadingPreviewUrl = null;
+    };
     img.src = preview.image_url;
-    initCanvasPan();
   }
 
   let isDraggingCanvas = false;
@@ -655,15 +717,29 @@
         <div class="step-banner ${isAligned ? 'aligned' : ''}">${stepBannerText}</div>
 
         ${
+          pa.solve_warning
+            ? `<div class="step-banner" style="border-left-color:var(--warn-col);background:var(--warn-bg);font-size:12px">
+                 ⚠️ ${pa.solve_warning}
+               </div>`
+            : ''
+        }
+
+        ${
           !calibrated
-            ? `<button class="btn btn-lg btn-primary" data-action="pa-capture">
-                 CAPTURE CALIBRATION POINT ${pts + 1} OF ${needed}
+            ? `<button class="btn btn-lg btn-primary" data-action="pa-capture" ${store.busyAction ? 'disabled' : ''}>
+                 ${
+                   store.busyAction === 'pa-capture'
+                     ? '⏳ EXPOSING &amp; PLATE-SOLVING...'
+                     : `📸 CAPTURE CALIBRATION POINT ${pts + 1} OF ${needed} (${store.manualExposure}s @ ISO ${store.manualIso})`
+                 }
                </button>`
             : `<div style="display:grid;grid-template-columns:1.4fr 1fr;gap:8px">
                  <button class="btn btn-lg ${pa.loop_running ? 'btn-warn' : 'btn-primary'}" data-action="pa-loop">
                    ${pa.loop_running ? '⏹ STOP LIVE LOOP (RESTORE RAW)' : '▶ START 2.5s LIVE SOLVE LOOP'}
                  </button>
-                 <button class="btn btn-lg" data-action="pa-capture">SINGLE SOLVE</button>
+                 <button class="btn btn-lg" data-action="pa-capture" ${store.busyAction ? 'disabled' : ''}>
+                   ${store.busyAction === 'pa-capture' ? '⏳ SOLVING...' : 'SINGLE SOLVE'}
+                 </button>
                </div>`
         }
 
@@ -841,8 +917,12 @@
 
           <div class="catalog-list" id="framing-catalog-list">${store.catalogLoading ? '<div style="padding:16px;text-align:center;color:var(--text-muted)">⏳ Updating live altitudes...</div>' : (catRows || `<div style="padding:14px;font-size:12px;color:var(--text-muted);text-align:center">No matching objects found. <button class="btn btn-sm" data-action="toggle-horizon-filter" style="margin-left:6px">${store.catalogAboveHorizon ? 'Show All Sky Targets' : 'Clear Filters'}</button></div>`)}</div>
 
-          <button class="btn btn-lg btn-primary" data-action="frame-solve">
-            📸 CAPTURE &amp; PLATE-SOLVE PUSH-TO OFFSET
+          <button class="btn btn-lg btn-primary" data-action="frame-solve" ${store.busyAction ? 'disabled' : ''}>
+            ${
+              store.busyAction === 'frame-solve'
+                ? '⏳ EXPOSING &amp; PLATE-SOLVING...'
+                : `📸 CAPTURE &amp; PLATE-SOLVE PUSH-TO OFFSET (${store.manualExposure}s @ ISO ${store.manualIso})`
+            }
           </button>
 
           ${
@@ -900,7 +980,9 @@
           <button class="btn btn-lg ${focus.loop_running ? 'btn-warn' : 'btn-primary'}" data-action="focus-loop">
             ${focus.loop_running ? '⏹ STOP FOCUS LOOP (RAW)' : '▶ START CONTINUOUS FOCUS LOOP'}
           </button>
-          <button class="btn btn-lg" data-action="focus-shot">SINGLE SHOT</button>
+          <button class="btn btn-lg" data-action="focus-shot" ${store.busyAction ? 'disabled' : ''}>
+            ${store.busyAction === 'focus-shot' ? '⏳ EXPOSING...' : `SINGLE SHOT (${store.manualExposure}s)`}
+          </button>
         </div>
 
         <div class="kpi-grid">
@@ -953,7 +1035,27 @@
       (acc, s) => acc + Number(s.total_count || 0) * (Number(s.exposure_s || 0) + Number(s.cooldown_s || 0)),
       0
     );
-    const isRunning = sequence.status === 'RUNNING' || sequence.status === 'PAUSED' || sequence.status === 'INTERLOCK_PAUSED';
+    const isRunning =
+      sequence.status === 'RUNNING' ||
+      sequence.status === 'PAUSED' ||
+      sequence.status === 'AWAITING_INTERLOCK' ||
+      sequence.status === 'INTERLOCK_PAUSED';
+
+    const cam = store.state?.camera || {};
+    const sys = store.state?.system || {};
+    const obs = store.state?.observer || {};
+    const camOk = cam.driver_mode === 'gphoto2';
+    const clkOk = Boolean(obs.last_synced_at);
+    const diskOk = Number(sys.disk_free_gb || 0) >= 2.0;
+
+    let interlockBtnLabel = '✓ READY — RESUME SEQUENCE';
+    if (sequence.interlock_type === 'Dark' || sequence.interlock_type === 'Bias') {
+      interlockBtnLabel = `✓ LENS CAP IS ON — START ${String(sequence.interlock_type).toUpperCase()} FRAMES`;
+    } else if (sequence.interlock_type === 'Flat') {
+      interlockBtnLabel = '✓ FLAT PANEL / T-SHIRT READY — START FLATS';
+    } else if (sequence.interlock_type === 'Light') {
+      interlockBtnLabel = '✓ LENS UNCOVERED &amp; TRACKING ON — START LIGHTS';
+    }
 
     const rowsHtml = steps
       .map(
@@ -1006,11 +1108,26 @@
                  <div><strong>⚠️ PHYSICAL CALIBRATION INTERLOCK: ${sequence.interlock_type}</strong></div>
                  <div>${sequence.interlock_message}</div>
                  <button class="btn btn-lg btn-primary" data-action="seq-confirm-interlock">
-                   ✓ I HAVE COVERED THE LENS — RESUME SEQUENCE
+                   ${interlockBtnLabel}
                  </button>
                </div>`
             : ''
         }
+
+        <div class="preflight-grid">
+          <div class="preflight-pill">
+            <span style="color:var(--text-muted)">CAMERA</span>
+            <strong style="color:${camOk ? 'var(--ok-col)' : 'var(--warn-col)'}">${camOk ? '🟢 EOS M200' : '⚠️ Simulator'}</strong>
+          </div>
+          <div class="preflight-pill">
+            <span style="color:var(--text-muted)">CLOCK</span>
+            <strong style="color:${clkOk ? 'var(--ok-col)' : 'var(--warn-col)'}">${clkOk ? '🟢 Synced' : '⚠️ Tap Clock'}</strong>
+          </div>
+          <div class="preflight-pill">
+            <span style="color:var(--text-muted)">STORAGE</span>
+            <strong style="color:${diskOk ? 'var(--ok-col)' : 'var(--accent)'}">${diskOk ? `🟢 ${sys.disk_free_gb} GB` : `⚠️ ${sys.disk_free_gb} GB`}</strong>
+          </div>
+        </div>
 
         <div class="kpi-grid">
           <div class="kpi-box">
@@ -1289,7 +1406,13 @@
           </div>
 
           <div style="display:grid;gap:8px;border-top:1px solid var(--border-col);padding-top:10px">
-            <div class="kpi-label">3. CANON EOS M200 USB RECOVERY</div>
+            <div class="kpi-label">3. ASTAP PLATE-SOLVER &amp; CANON USB HARDWARE</div>
+            <div class="preflight-pill">
+              <span style="color:var(--text-muted)">ASTAP SOLVER (180mm)</span>
+              <strong style="color:${store.state?.system?.astap_ready ? 'var(--ok-col)' : 'var(--warn-col)'}">
+                ${store.state?.system?.astap_ready ? `🟢 ${store.state.system.astap_status}` : `⚠️ ${store.state?.system?.astap_status || 'Check ASTAP'}`}
+              </strong>
+            </div>
             <p style="font-size:11px;color:var(--text-muted)">
               If the camera shutter locks up or USB disconnects in the cold, issue a kernel USBDEVFS_RESET:
             </p>
@@ -1389,6 +1512,20 @@
         <button class="btn ${store.activeTab === 'OFFLOAD' ? 'btn-active' : ''}" data-tab="OFFLOAD">4. SESSIONS &amp; OFFLOAD</button>
       </nav>
 
+      ${
+        store.notice
+          ? `<div style="padding:0 12px">
+               <div class="notice-banner ${store.notice.level || 'err'}">
+                 <div>
+                   <strong>${store.notice.level === 'ok' ? '✓' : '⚠️'}</strong>
+                   <span style="margin-left:6px">${store.notice.message}</span>
+                 </div>
+                 <button class="btn btn-sm" data-action="dismiss-notice" style="min-height:28px;padding:2px 8px">✕</button>
+               </div>
+             </div>`
+          : ''
+      }
+
       <main class="main-grid">
         ${tabHtml}
         <div class="card">
@@ -1413,11 +1550,16 @@
               <button class="btn btn-sm ${store.liveLoopRunning ? 'btn-warn' : ''}" data-action="toggle-live-loop" title="Stream live viewfinder from sensor without physical shutter">
                 ${store.liveLoopRunning ? '⏹ Stop Live View' : '▶ Live Viewfinder'}
               </button>
+              <button id="btn-toggle-stretch" class="btn btn-sm ${preview?.auto_stretched !== false ? 'btn-active' : ''}" data-action="toggle-stretch" title="Toggle PixInsight MTF Auto-Stretch (turn OFF for daylight or Flat frames)">
+                ${preview?.auto_stretched !== false ? '✨ Stretch: ON' : 'Stretch: OFF'}
+              </button>
               <button class="btn btn-sm ${store.zoom > 1 ? 'btn-active' : ''}" data-action="toggle-zoom" title="Cycle 1x Fit / 2x Zoom / 4x Zoom">
                 🔍 ${store.zoom > 1 ? `${store.zoom}x Zoom` : '1x Fit'}
               </button>
               ${store.zoom > 1 ? `<button class="btn btn-sm" data-action="reset-pan" title="Center pan on image">🎯 Center</button>` : ''}
-              <button class="btn btn-sm btn-primary" data-action="manual-shot">📸 Test Shot</button>
+              <button class="btn btn-sm btn-primary" data-action="manual-shot" ${store.busyAction ? 'disabled' : ''}>
+                ${store.busyAction === 'manual-shot' ? '⏳ Shooting...' : '📸 Test Shot'}
+              </button>
             </div>
           </div>
           ${
@@ -1554,9 +1696,11 @@
     }
     if (t.id === 'preview-exp-sel') {
       store.manualExposure = t.value;
+      render();
       await api('/api/camera/config', 'POST', { exposure_s: Number(t.value) }).catch(() => {});
     } else if (t.id === 'preview-iso-sel') {
       store.manualIso = t.value;
+      render();
       await api('/api/camera/config', 'POST', { iso: t.value }).catch(() => {});
     }
   });
@@ -1599,330 +1743,373 @@
     const act = btn.dataset.action;
     if (!act) return;
 
-    if (act === 'toggle-nv') {
-      store.nightVision = !store.nightVision;
-      document.documentElement.classList.toggle('night-vision', store.nightVision);
+    if (act === 'dismiss-notice') {
+      store.notice = null;
       render();
-    } else if (act === 'toggle-zoom') {
-      if (store.zoom === 1.0) {
-        store.zoom = 2.0;
-      } else if (store.zoom === 2.0) {
-        store.zoom = 4.0;
-      } else {
-        store.zoom = 1.0;
+      return;
+    }
+
+    const expVal = Number(store.manualExposure || 2.0);
+    const isoVal = String(store.manualIso || '1600');
+
+    try {
+      if (act === 'toggle-nv') {
+        store.nightVision = !store.nightVision;
+        document.documentElement.classList.toggle('night-vision', store.nightVision);
+        render();
+      } else if (act === 'toggle-stretch') {
+        await api('/api/camera/preview-stretch', 'POST', {});
+        await refreshAll();
+      } else if (act === 'toggle-zoom') {
+        if (store.zoom === 1.0) {
+          store.zoom = 2.0;
+        } else if (store.zoom === 2.0) {
+          store.zoom = 4.0;
+        } else {
+          store.zoom = 1.0;
+          store.panX = 0.5;
+          store.panY = 0.5;
+        }
+        render();
+        renderPreviewCanvas();
+      } else if (act === 'reset-pan') {
         store.panX = 0.5;
         store.panY = 0.5;
-      }
-      render();
-      renderPreviewCanvas();
-    } else if (act === 'reset-pan') {
-      store.panX = 0.5;
-      store.panY = 0.5;
-      renderPreviewCanvas();
-    } else if (act === 'open-drawer') {
-      store.drawerOpen = true;
-      const pr = await api('/api/system/presets');
-      store.presets = pr.presets || [];
-      render();
-    } else if (act === 'close-drawer') {
-      store.drawerOpen = false;
-      render();
-    } else if (act === 'toggle-sim-controls') {
-      store.showSimControls = !store.showSimControls;
-      render();
-    } else if (act === 'apply-preset') {
-      await api('/api/system/location-time', 'PUT', {
-        latitude_deg: Number(btn.dataset.lat),
-        longitude_deg: Number(btn.dataset.lon),
-        elevation_m: Number(btn.dataset.elev || 300),
-        client_utc_timestamp: Date.now() / 1000,
-        sync_source: `Preset: ${btn.dataset.name}`,
-      });
-      await refreshAll();
-    } else if (act === 'save-site-coords') {
-      const lat = Number(document.getElementById('drawer-lat')?.value ?? 38.8951);
-      const lon = Number(document.getElementById('drawer-lon')?.value ?? -77.0364);
-      const name = document.getElementById('drawer-preset-name')?.value || 'Custom Site';
-      await api('/api/system/presets', 'POST', {
-        name,
-        latitude_deg: lat,
-        longitude_deg: lon,
-        make_default: true,
-      });
-      await api('/api/system/location-time', 'PUT', {
-        latitude_deg: lat,
-        longitude_deg: lon,
-        client_utc_timestamp: Date.now() / 1000,
-        sync_source: `Saved: ${name}`,
-      });
-      const pr = await api('/api/system/presets');
-      store.presets = pr.presets || [];
-      await refreshAll();
-    } else if (act === 'sync-gps') {
-      const doSync = async (coords = null) => {
-        const payload = {
+        renderPreviewCanvas();
+      } else if (act === 'open-drawer') {
+        store.drawerOpen = true;
+        const pr = await api('/api/system/presets');
+        store.presets = pr.presets || [];
+        render();
+      } else if (act === 'close-drawer') {
+        store.drawerOpen = false;
+        render();
+      } else if (act === 'toggle-sim-controls') {
+        store.showSimControls = !store.showSimControls;
+        render();
+      } else if (act === 'apply-preset') {
+        await api('/api/system/location-time', 'PUT', {
+          latitude_deg: Number(btn.dataset.lat),
+          longitude_deg: Number(btn.dataset.lon),
+          elevation_m: Number(btn.dataset.elev || 300),
           client_utc_timestamp: Date.now() / 1000,
-          sync_source: coords ? 'Browser GPS & Clock' : 'Browser Device Clock',
-        };
-        if (coords) {
-          payload.latitude_deg = coords.latitude;
-          payload.longitude_deg = coords.longitude;
-          if (coords.altitude) payload.elevation_m = coords.altitude;
-        }
-        await api('/api/system/location-time', 'PUT', payload);
+          sync_source: `Preset: ${btn.dataset.name}`,
+        });
+        showNotice(`Site set to ${btn.dataset.name} & UTC clock synced.`, 'ok', 4000);
         await refreshAll();
-        loadCatalog().catch(() => {});
-      };
+      } else if (act === 'save-site-coords') {
+        const lat = Number(document.getElementById('drawer-lat')?.value ?? 38.8951);
+        const lon = Number(document.getElementById('drawer-lon')?.value ?? -77.0364);
+        const name = document.getElementById('drawer-preset-name')?.value || 'Custom Site';
+        await api('/api/system/presets', 'POST', {
+          name,
+          latitude_deg: lat,
+          longitude_deg: lon,
+          make_default: true,
+        });
+        await api('/api/system/location-time', 'PUT', {
+          latitude_deg: lat,
+          longitude_deg: lon,
+          client_utc_timestamp: Date.now() / 1000,
+          sync_source: `Saved: ${name}`,
+        });
+        const pr = await api('/api/system/presets');
+        store.presets = pr.presets || [];
+        showNotice(`Saved observing site "${name}" & synced UTC clock.`, 'ok', 4000);
+        await refreshAll();
+      } else if (act === 'sync-gps') {
+        const doSync = async (coords = null) => {
+          try {
+            const payload = {
+              client_utc_timestamp: Date.now() / 1000,
+              sync_source: coords ? 'Browser GPS & Clock' : 'Browser Device Clock',
+            };
+            if (coords) {
+              payload.latitude_deg = coords.latitude;
+              payload.longitude_deg = coords.longitude;
+              if (coords.altitude) payload.elevation_m = coords.altitude;
+            }
+            await api('/api/system/location-time', 'PUT', payload);
+            showNotice(
+              coords ? 'Synced GPS coordinates & UTC clock!' : 'Synced UTC clock from device!',
+              'ok',
+              4000
+            );
+            await refreshAll();
+            loadCatalog().catch(() => {});
+          } catch (err) {
+            showNotice(`Clock/GPS sync failed: ${err.message}`, 'err');
+          }
+        };
 
-      if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(
-          (pos) => doSync(pos.coords),
-          () => doSync(null),
-          { timeout: 6000 }
-        );
-      } else {
-        await doSync(null);
-      }
-    } else if (act === 'connect-camera') {
-      try {
+        if (navigator.geolocation) {
+          navigator.geolocation.getCurrentPosition(
+            (pos) => doSync(pos.coords),
+            () => doSync(null),
+            { timeout: 6000 }
+          );
+        } else {
+          await doSync(null);
+        }
+      } else if (act === 'connect-camera') {
+        store.busyAction = 'connect-camera';
+        render();
         const res = await api('/api/camera/connect', 'POST');
         if (res.driver_mode === 'gphoto2') {
-          alert('🟢 Success! Connected to physical Canon EOS M200 via USB PTP.');
+          showNotice('Connected to physical Canon EOS M200 via USB PTP!', 'ok', 5000);
         } else {
-          const detail = res.last_error ? `\n\nDiagnostic info: ${res.last_error}` : '';
-          alert(
-            '⚠️ Canon EOS M200 not detected on USB.\n\n' +
-            'Please check:\n' +
-            '1. Camera power is turned ON\n' +
-            '2. Mode dial is set to Manual ("M")\n' +
-            '3. Auto Power Off / Sleep is set to "Disable" in camera menu\n' +
-            '4. USB cable is a DATA sync cable (not charge-only)\n' +
-            '5. Plugged firmly into Raspberry Pi USB port' +
-            detail
+          const detail = res.last_error ? ` (${res.last_error})` : '';
+          showNotice(
+            `Canon EOS M200 not detected on USB. Verify camera is ON in Manual ("M") mode with data USB cable.${detail}`,
+            'warn',
+            12000
           );
         }
-      } catch (err) {
-        alert('Failed to connect to camera: ' + err.message);
-      }
-      await refreshAll();
-    } else if (act === 'toggle-live-loop') {
-      if (store.liveLoopRunning) {
-        store.liveLoopRunning = false;
-        render();
-        await api('/api/camera/live-loop/stop', 'POST').catch(() => {});
-      } else {
-        store.liveLoopRunning = true;
-        render();
-        await api('/api/camera/live-loop/start', 'POST', { exposure_s: 1.5, iso: '1600' }).catch(() => {
+        await refreshAll();
+      } else if (act === 'toggle-live-loop') {
+        if (store.liveLoopRunning) {
           store.liveLoopRunning = false;
           render();
-        });
-      }
-      await refreshAll();
-    } else if (act === 'usb-reset') {
-      await api('/api/camera/reset-usb', 'POST');
-      await refreshAll();
-    } else if (act === 'manual-shot') {
-      try {
+          await api('/api/camera/live-loop/stop', 'POST').catch(() => {});
+        } else {
+          store.liveLoopRunning = true;
+          render();
+          await api('/api/camera/live-loop/start', 'POST', { exposure_s: expVal, iso: isoVal }).catch((err) => {
+            store.liveLoopRunning = false;
+            showNotice(`Live Viewfinder error: ${err.message}`, 'err');
+          });
+        }
+        await refreshAll();
+      } else if (act === 'usb-reset') {
+        store.busyAction = 'usb-reset';
+        render();
+        await api('/api/camera/reset-usb', 'POST');
+        showNotice('Issued USB port reset to Canon EOS M200.', 'ok', 5000);
+        await refreshAll();
+      } else if (act === 'manual-shot') {
+        store.busyAction = 'manual-shot';
+        render();
         await api('/api/camera/capture', 'POST', {
-          exposure_s: Number(store.manualExposure || 2.0),
-          iso: String(store.manualIso || '1600'),
+          exposure_s: expVal,
+          iso: isoVal,
           fast_jpeg: true,
         });
-      } catch (err) {
-        alert('Camera capture error: ' + err.message);
-      }
-      await refreshAll();
-    } else if (act === 'pa-mode-3') {
-      await api('/api/pa/start', 'POST', { mode_points: 3 });
-      await refreshAll();
-    } else if (act === 'pa-mode-2') {
-      await api('/api/pa/start', 'POST', { mode_points: 2 });
-      await refreshAll();
-    } else if (act === 'pa-capture') {
-      if ((store.state.pa.points || []).length < store.state.pa.mode_points) {
-        await api('/api/pa/capture-point', 'POST', { exposure_s: 1.5, iso: '1600' });
-      } else {
-        await api('/api/pa/live-step', 'POST', { exposure_s: 1.5, iso: '1600' });
-      }
-      await refreshAll();
-    } else if (act === 'pa-loop') {
-      if (store.state.pa.loop_running) {
-        await api('/api/pa/live-loop/stop', 'POST', { restore_raw: true });
-      } else {
-        await api('/api/pa/live-loop/start', 'POST', { exposure_s: 1.5, iso: '1600' });
-      }
-      await refreshAll();
-    } else if (act === 'pa-sim-align') {
-      await api('/api/pa/sim-control', 'POST', {
-        d_alt_arcmin: -store.state.pa.alt_error_arcmin * 0.92,
-        d_az_arcmin: -store.state.pa.az_error_arcmin * 0.92,
-      });
-      await refreshAll();
-    } else if (act === 'toggle-horizon-filter') {
-      store.catalogAboveHorizon = !store.catalogAboveHorizon;
-      loadCatalog().catch(() => {});
-      render();
-    } else if (act === 'toggle-tpo180-filter') {
-      store.catalogTpo180Only = !store.catalogTpo180Only;
-      loadCatalog().catch(() => {});
-      render();
-    } else if (act === 'toggle-custom-target') {
-      store.customTargetOpen = !store.customTargetOpen;
-      render();
-    } else if (act === 'apply-custom-target') {
-      await api('/api/framing/select-target', 'POST', {
-        target_id: 'CUSTOM',
-        target_name: store.customTargetName || 'Custom Target',
-        target_ra_hours: store.customTargetRa,
-        target_dec_deg: store.customTargetDec,
-      });
-      store.customTargetOpen = false;
-      await refreshAll();
-    } else if (act === 'frame-solve') {
-      await api('/api/framing/solve', 'POST', { exposure_s: 2.0, iso: '1600' });
-      await refreshAll();
-    } else if (act === 'frame-sim-center') {
-      await api('/api/framing/solve', 'POST', { exposure_s: 2.0, iso: '1600', sim_center_on_target: true });
-      await refreshAll();
-    } else if (act === 'focus-shot') {
-      await api('/api/framing/focus-step', 'POST', { exposure_s: 1.5, iso: '1600' });
-      await refreshAll();
-    } else if (act === 'focus-loop') {
-      if (store.state.focus.loop_running) {
-        await api('/api/framing/focus-loop/stop', 'POST');
-      } else {
-        await api('/api/framing/focus-loop/start', 'POST', { exposure_s: 1.5, iso: '1600' });
-      }
-      await refreshAll();
-    } else if (act === 'focus-reset-min') {
-      await api('/api/framing/focus-roi', 'POST', {
-        roi: store.state.focus.roi,
-        reset_history: true,
-      });
-      await refreshAll();
-    } else if (act === 'focus-toggle-roi') {
-      const hasRoi = Boolean(store.state.focus.roi);
-      await api('/api/framing/focus-roi', 'POST', {
-        clear: hasRoi,
-        roi: hasRoi ? null : { x: 0.5, y: 0.5, size: 240 },
-      });
-      await refreshAll();
-    } else if (act === 'focus-sim-in') {
-      await api('/api/framing/focus-step', 'POST', { exposure_s: 1.5, iso: '1600', sim_focus_delta: -0.5 });
-      await refreshAll();
-    } else if (act === 'seq-preset-b8-broad') {
-      store.editingSteps = [
-        { frame_type: 'Light', exposure_s: 30, iso: '400', total_count: 60, cooldown_s: 1.5 },
-        { frame_type: 'Dark', exposure_s: 30, iso: '400', total_count: 20, cooldown_s: 1.0 },
-        { frame_type: 'Bias', exposure_s: 0.001, iso: '400', total_count: 30, cooldown_s: 0.5 },
-        { frame_type: 'Flat', exposure_s: 0.5, iso: '100', total_count: 20, cooldown_s: 1.0 },
-      ];
-      store.planSavedBanner = false;
-      render();
-    } else if (act === 'seq-preset-b8-dual') {
-      store.editingSteps = [
-        { frame_type: 'Light', exposure_s: 120, iso: '800', total_count: 25, cooldown_s: 2.0 },
-        { frame_type: 'Dark', exposure_s: 120, iso: '800', total_count: 10, cooldown_s: 1.0 },
-        { frame_type: 'Bias', exposure_s: 0.001, iso: '800', total_count: 25, cooldown_s: 0.5 },
-        { frame_type: 'Flat', exposure_s: 1.0, iso: '100', total_count: 20, cooldown_s: 1.0 },
-      ];
-      store.planSavedBanner = false;
-      render();
-    } else if (act === 'seq-preset-dark') {
-      store.editingSteps = [
-        { frame_type: 'Light', exposure_s: 90, iso: '800', total_count: 25, cooldown_s: 2.0 },
-        { frame_type: 'Dark', exposure_s: 90, iso: '800', total_count: 10, cooldown_s: 1.0 },
-        { frame_type: 'Bias', exposure_s: 0.001, iso: '800', total_count: 25, cooldown_s: 0.5 },
-        { frame_type: 'Flat', exposure_s: 0.5, iso: '100', total_count: 20, cooldown_s: 1.0 },
-      ];
-      store.planSavedBanner = false;
-      render();
-    } else if (act === 'seq-add-step') {
-      if (!store.editingSteps) store.editingSteps = [];
-      store.editingSteps.push({
-        frame_type: 'Light',
-        exposure_s: 90,
-        iso: '800',
-        total_count: 15,
-        cooldown_s: 2.0,
-      });
-      render();
-    } else if (act === 'seq-remove-step') {
-      const idx = Number(btn.dataset.idx);
-      if (store.editingSteps && store.editingSteps.length > 1) {
-        store.editingSteps.splice(idx, 1);
+        await refreshAll();
+      } else if (act === 'pa-mode-3') {
+        await api('/api/pa/start', 'POST', { mode_points: 3 });
+        await refreshAll();
+      } else if (act === 'pa-mode-2') {
+        await api('/api/pa/start', 'POST', { mode_points: 2 });
+        await refreshAll();
+      } else if (act === 'pa-capture') {
+        store.busyAction = 'pa-capture';
         render();
-      }
-    } else if (act === 'seq-save-plan') {
-      const saved = await api('/api/sequence/plans', 'POST', {
-        id: store.editingPlanId,
-        name: store.editingPlanName || `${store.state.framing.target_name} Plan`,
-        target_name: store.state.framing.target_name,
-        target_ra_hours: store.state.framing.target_ra_hours,
-        target_dec_deg: store.state.framing.target_dec_deg,
-        steps: store.editingSteps,
-      });
-      store.editingPlanId = saved.id;
-      store.planSavedBanner = true;
-      await refreshAll();
-    } else if (act === 'seq-start') {
-      const saved = await api('/api/sequence/plans', 'POST', {
-        id: store.editingPlanId,
-        name: store.editingPlanName || `${store.state.framing.target_name} Plan`,
-        target_name: store.state.framing.target_name,
-        target_ra_hours: store.state.framing.target_ra_hours,
-        target_dec_deg: store.state.framing.target_dec_deg,
-        steps: store.editingSteps,
-      });
-      store.editingPlanId = saved.id;
-      await api(`/api/sequence/plans/${saved.id}/start`, 'POST', { reset_progress: true });
-      await refreshAll();
-    } else if (act === 'seq-pause') {
-      await api('/api/sequence/pause', 'POST');
-      await refreshAll();
-    } else if (act === 'seq-resume') {
-      await api('/api/sequence/resume', 'POST');
-      await refreshAll();
-    } else if (act === 'seq-confirm-interlock') {
-      await api('/api/sequence/confirm-interlock', 'POST');
-      await refreshAll();
-    } else if (act === 'seq-abort') {
-      if (!store.abortArmed) {
-        store.abortArmed = true;
+        if ((store.state.pa.points || []).length < store.state.pa.mode_points) {
+          await api('/api/pa/capture-point', 'POST', { exposure_s: expVal, iso: isoVal });
+        } else {
+          await api('/api/pa/live-step', 'POST', { exposure_s: expVal, iso: isoVal });
+        }
+        await refreshAll();
+      } else if (act === 'pa-loop') {
+        if (store.state.pa.loop_running) {
+          await api('/api/pa/live-loop/stop', 'POST', { restore_raw: true });
+        } else {
+          await api('/api/pa/live-loop/start', 'POST', { exposure_s: expVal, iso: isoVal });
+        }
+        await refreshAll();
+      } else if (act === 'pa-sim-align') {
+        await api('/api/pa/sim-control', 'POST', {
+          d_alt_arcmin: -store.state.pa.alt_error_arcmin * 0.92,
+          d_az_arcmin: -store.state.pa.az_error_arcmin * 0.92,
+        });
+        await refreshAll();
+      } else if (act === 'toggle-horizon-filter') {
+        store.catalogAboveHorizon = !store.catalogAboveHorizon;
+        loadCatalog().catch(() => {});
         render();
-        setTimeout(() => {
-          store.abortArmed = false;
+      } else if (act === 'toggle-tpo180-filter') {
+        store.catalogTpo180Only = !store.catalogTpo180Only;
+        loadCatalog().catch(() => {});
+        render();
+      } else if (act === 'toggle-custom-target') {
+        store.customTargetOpen = !store.customTargetOpen;
+        render();
+      } else if (act === 'apply-custom-target') {
+        await api('/api/framing/select-target', 'POST', {
+          target_id: 'CUSTOM',
+          target_name: store.customTargetName || 'Custom Target',
+          target_ra_hours: store.customTargetRa,
+          target_dec_deg: store.customTargetDec,
+        });
+        store.customTargetOpen = false;
+        showNotice(`Custom target "${store.customTargetName}" selected.`, 'ok', 4000);
+        await refreshAll();
+      } else if (act === 'frame-solve') {
+        store.busyAction = 'frame-solve';
+        render();
+        await api('/api/framing/solve', 'POST', { exposure_s: expVal, iso: isoVal });
+        await refreshAll();
+      } else if (act === 'frame-sim-center') {
+        store.busyAction = 'frame-solve';
+        render();
+        await api('/api/framing/solve', 'POST', { exposure_s: expVal, iso: isoVal, sim_center_on_target: true });
+        await refreshAll();
+      } else if (act === 'focus-shot') {
+        store.busyAction = 'focus-shot';
+        render();
+        await api('/api/framing/focus-step', 'POST', { exposure_s: expVal, iso: isoVal });
+        await refreshAll();
+      } else if (act === 'focus-loop') {
+        if (store.state.focus.loop_running) {
+          await api('/api/framing/focus-loop/stop', 'POST');
+        } else {
+          await api('/api/framing/focus-loop/start', 'POST', { exposure_s: expVal, iso: isoVal });
+        }
+        await refreshAll();
+      } else if (act === 'focus-reset-min') {
+        await api('/api/framing/focus-roi', 'POST', {
+          roi: store.state.focus.roi,
+          reset_history: true,
+        });
+        await refreshAll();
+      } else if (act === 'focus-toggle-roi') {
+        const hasRoi = Boolean(store.state.focus.roi);
+        await api('/api/framing/focus-roi', 'POST', {
+          clear: hasRoi,
+          roi: hasRoi ? null : { x: 0.5, y: 0.5, size: 240 },
+        });
+        await refreshAll();
+      } else if (act === 'focus-sim-in') {
+        store.busyAction = 'focus-shot';
+        render();
+        await api('/api/framing/focus-step', 'POST', { exposure_s: expVal, iso: isoVal, sim_focus_delta: -0.5 });
+        await refreshAll();
+      } else if (act === 'seq-preset-b8-broad') {
+        store.editingSteps = [
+          { frame_type: 'Light', exposure_s: 30, iso: '400', total_count: 60, cooldown_s: 1.5 },
+          { frame_type: 'Dark', exposure_s: 30, iso: '400', total_count: 20, cooldown_s: 1.0 },
+          { frame_type: 'Bias', exposure_s: 0.001, iso: '400', total_count: 30, cooldown_s: 0.5 },
+          { frame_type: 'Flat', exposure_s: 0.5, iso: '100', total_count: 20, cooldown_s: 1.0 },
+        ];
+        store.planSavedBanner = false;
+        render();
+      } else if (act === 'seq-preset-b8-dual') {
+        store.editingSteps = [
+          { frame_type: 'Light', exposure_s: 120, iso: '800', total_count: 25, cooldown_s: 2.0 },
+          { frame_type: 'Dark', exposure_s: 120, iso: '800', total_count: 10, cooldown_s: 1.0 },
+          { frame_type: 'Bias', exposure_s: 0.001, iso: '800', total_count: 25, cooldown_s: 0.5 },
+          { frame_type: 'Flat', exposure_s: 1.0, iso: '100', total_count: 20, cooldown_s: 1.0 },
+        ];
+        store.planSavedBanner = false;
+        render();
+      } else if (act === 'seq-preset-dark') {
+        store.editingSteps = [
+          { frame_type: 'Light', exposure_s: 90, iso: '800', total_count: 25, cooldown_s: 2.0 },
+          { frame_type: 'Dark', exposure_s: 90, iso: '800', total_count: 10, cooldown_s: 1.0 },
+          { frame_type: 'Bias', exposure_s: 0.001, iso: '800', total_count: 25, cooldown_s: 0.5 },
+          { frame_type: 'Flat', exposure_s: 0.5, iso: '100', total_count: 20, cooldown_s: 1.0 },
+        ];
+        store.planSavedBanner = false;
+        render();
+      } else if (act === 'seq-add-step') {
+        if (!store.editingSteps) store.editingSteps = [];
+        store.editingSteps.push({
+          frame_type: 'Light',
+          exposure_s: 90,
+          iso: '800',
+          total_count: 15,
+          cooldown_s: 2.0,
+        });
+        render();
+      } else if (act === 'seq-remove-step') {
+        const idx = Number(btn.dataset.idx);
+        if (store.editingSteps && store.editingSteps.length > 1) {
+          store.editingSteps.splice(idx, 1);
           render();
-        }, 4000);
-        return;
+        }
+      } else if (act === 'seq-save-plan') {
+        const saved = await api('/api/sequence/plans', 'POST', {
+          id: store.editingPlanId,
+          name: store.editingPlanName || `${store.state.framing.target_name} Plan`,
+          target_name: store.state.framing.target_name,
+          target_ra_hours: store.state.framing.target_ra_hours,
+          target_dec_deg: store.state.framing.target_dec_deg,
+          steps: store.editingSteps,
+        });
+        store.editingPlanId = saved.id;
+        store.planSavedBanner = true;
+        await refreshAll();
+      } else if (act === 'seq-start') {
+        store.busyAction = 'seq-start';
+        render();
+        const saved = await api('/api/sequence/plans', 'POST', {
+          id: store.editingPlanId,
+          name: store.editingPlanName || `${store.state.framing.target_name} Plan`,
+          target_name: store.state.framing.target_name,
+          target_ra_hours: store.state.framing.target_ra_hours,
+          target_dec_deg: store.state.framing.target_dec_deg,
+          steps: store.editingSteps,
+        });
+        store.editingPlanId = saved.id;
+        await api(`/api/sequence/plans/${saved.id}/start`, 'POST', { reset_progress: true });
+        showNotice(`Started .CR3 imaging sequence for ${store.state.framing.target_name}!`, 'ok', 5000);
+        await refreshAll();
+      } else if (act === 'seq-pause') {
+        await api('/api/sequence/pause', 'POST');
+        await refreshAll();
+      } else if (act === 'seq-resume') {
+        await api('/api/sequence/resume', 'POST');
+        await refreshAll();
+      } else if (act === 'seq-confirm-interlock') {
+        await api('/api/sequence/confirm-interlock', 'POST');
+        await refreshAll();
+      } else if (act === 'seq-abort') {
+        if (!store.abortArmed) {
+          store.abortArmed = true;
+          render();
+          setTimeout(() => {
+            store.abortArmed = false;
+            render();
+          }, 4000);
+          return;
+        }
+        store.abortArmed = false;
+        await api('/api/sequence/abort', 'POST');
+        showNotice('Imaging sequence aborted & camera restored to RAW (.CR3).', 'warn', 5000);
+        await refreshAll();
+      } else if (act === 'usb-eject') {
+        const r = await api('/api/system/storage/eject', 'POST');
+        showNotice(r.message, 'ok', 8000);
+        await refreshAll();
+      } else if (act === 'sess-toggle-frames') {
+        const sid = btn.dataset.session;
+        store.expandedSessionId = store.expandedSessionId === sid ? null : sid;
+        render();
+      } else if (act === 'frame-cull-toggle') {
+        const sid = btn.dataset.session;
+        const fid = btn.dataset.frame;
+        const nextStatus = btn.dataset.nextStatus;
+        await api(`/api/sessions/${sid}/frames/${fid}/cull`, 'POST', {
+          status: nextStatus,
+          reject_reason: nextStatus === 'rejected' ? 'Manual user cull' : '',
+        });
+        await refreshAll();
+      } else if (act === 'sess-autocull') {
+        const res = await api(`/api/sessions/${btn.dataset.session}/auto-cull`, 'POST', { hfr_sigma_limit: 2.0 });
+        showNotice(`Auto-cull complete: flagged ${res.rejected_count || 0} outlier sub-frame(s).`, 'ok', 5000);
+        await refreshAll();
+      } else if (act === 'sess-purge') {
+        const res = await api(`/api/sessions/${btn.dataset.session}/purge-rejected`, 'POST');
+        showNotice(`Deleted ${res.deleted_frames || 0} rejected file(s) (${res.freed_mb || 0} MB freed).`, 'ok', 5000);
+        await refreshAll();
       }
-      store.abortArmed = false;
-      await api('/api/sequence/abort', 'POST');
-      await refreshAll();
-    } else if (act === 'usb-eject') {
-      const r = await api('/api/system/storage/eject', 'POST');
-      alert(r.message);
-      await refreshAll();
-    } else if (act === 'sess-toggle-frames') {
-      const sid = btn.dataset.session;
-      store.expandedSessionId = store.expandedSessionId === sid ? null : sid;
-      render();
-    } else if (act === 'frame-cull-toggle') {
-      const sid = btn.dataset.session;
-      const fid = btn.dataset.frame;
-      const nextStatus = btn.dataset.nextStatus;
-      await api(`/api/sessions/${sid}/frames/${fid}/cull`, 'POST', {
-        status: nextStatus,
-        reject_reason: nextStatus === 'rejected' ? 'Manual user cull' : '',
-      });
-      await refreshAll();
-    } else if (act === 'sess-autocull') {
-      await api(`/api/sessions/${btn.dataset.session}/auto-cull`, 'POST', { hfr_sigma_limit: 2.0 });
-      await refreshAll();
-    } else if (act === 'sess-purge') {
-      await api(`/api/sessions/${btn.dataset.session}/purge-rejected`, 'POST');
-      await refreshAll();
+    } catch (err) {
+      showNotice(err.message || 'Action failed', 'err', 12000);
+    } finally {
+      if (store.busyAction) {
+        store.busyAction = null;
+        render();
+      }
     }
   });
 

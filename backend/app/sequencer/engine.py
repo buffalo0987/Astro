@@ -8,14 +8,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PIL import Image
-
 from ..config import CONFIG
 from ..db import DB
 from ..hardware.camera_actor import CAMERA
-from ..imaging.cr3_parser import decode_cr3_preview_array
-from ..imaging.focus_metrics import compute_star_hfr_metrics
-from ..imaging.stretch import auto_stretch_rgb, compute_histogram_256
+from ..imaging.pipeline import process_and_publish_preview
 from ..state import STATE
 from .storage import STORAGE
 
@@ -146,6 +142,17 @@ class SequenceEngine:
     async def start_plan(self, plan_id: str, reset_progress: bool = False) -> Dict[str, Any]:
         if self._task is not None and not self._task.done():
             raise RuntimeError("Another sequence is already running")
+
+        # Stop any active PA or Focus fast-JPEG loop before starting RAW sequence
+        try:
+            from ..api.routes_framing import stop_focus_loop
+            from ..api.routes_pa import stop_pa_live_loop
+
+            await stop_pa_live_loop({"restore_raw": False})
+            if STATE.focus_state.get("loop_running"):
+                await stop_focus_loop()
+        except Exception:
+            pass
 
         plan = self.get_plan(plan_id)
         remaining_frames = sum(max(0, int(s["total_count"]) - (0 if reset_progress else int(s["completed_count"]))) for s in plan["steps"])
@@ -337,32 +344,34 @@ class SequenceEngine:
                         frame_type=frame_type,
                         mode="SEQUENCE",
                         keep_on_camera_sd=bool(plan.get("keep_on_camera_sd", 0)),
+                        max_retries=2,
                     )
-
-                    # Extract Tier-1 embedded JPEG preview, MTF stretch, histogram, and star HFR
-                    arr_rgb, _ = decode_cr3_preview_array(abs_path, max_dim=1200)
-                    stretched = auto_stretch_rgb(arr_rgb, enable_stretch=True)
-                    hist = compute_histogram_256(stretched)
-                    metrics = compute_star_hfr_metrics(arr_rgb) if frame_type.lower() == "light" else {
-                        "star_count": 0,
-                        "hfr_median": 0.0,
-                        "fwhm_arcsec": 0.0,
-                        "bg_median_adu": hist["median_adu"],
-                        "stars": [],
-                    }
-
-                    # Save stretched preview to /dev/shm for live HUD & thumbnail in session previews/
-                    live_preview_file = CONFIG.shm_dir / "latest_preview.jpg"
-                    Image.fromarray(stretched).save(live_preview_file, format="JPEG", quality=85)
 
                     thumb_rel = f"previews/{Path(filename).stem}_thumb.jpg"
                     thumb_abs = session_dir / thumb_rel
-                    thumb_img = Image.fromarray(stretched)
-                    thumb_img.thumbnail((480, 320))
-                    thumb_img.save(thumb_abs, format="JPEG", quality=80)
+                    is_light = frame_type.lower() == "light"
+
+                    # Offload Tier-1 embedded JPEG extraction, MTF stretch, histogram, HFR & thumbnail save to thread
+                    _, metrics = await process_and_publish_preview(
+                        source_path=abs_path,
+                        max_dim=1280,
+                        compute_hfr=is_light,
+                        jpeg_quality=85,
+                        thumbnail_path=thumb_abs,
+                        source_label="RAW (.CR3)",
+                        max_overlay_stars=15 if is_light else 0,
+                        meta={
+                            "filename": filename,
+                            "frame_type": frame_type,
+                            "exposure_s": step["exposure_s"],
+                            "iso": step["iso"],
+                        },
+                        broadcast=False,
+                    )
 
                     fsize = abs_path.stat().st_size if abs_path.exists() else 0
-                    STORAGE.register_captured_frame(
+                    await asyncio.to_thread(
+                        STORAGE.register_captured_frame,
                         session_id=session_id,
                         plan_id=plan_id,
                         filename=filename,
@@ -388,29 +397,6 @@ class SequenceEngine:
                             "UPDATE sequence_plans SET active_step_index = ?, updated_at = ? WHERE id = ?",
                             (step_idx, time.time(), plan_id),
                         )
-
-                    ts_ms = int(time.time() * 1000)
-                    STATE.latest_preview.update(
-                        {
-                            "image_url": f"/api/camera/preview.jpg?t={ts_ms}",
-                            "timestamp": time.time(),
-                            "width": int(stretched.shape[1]),
-                            "height": int(stretched.shape[0]),
-                            "source_format": "RAW (.CR3)",
-                            "auto_stretched": True,
-                            "histogram": hist,
-                            "stars_overlay": metrics["stars"][:15],
-                            "meta": {
-                                "filename": filename,
-                                "frame_type": frame_type,
-                                "exposure_s": step["exposure_s"],
-                                "iso": step["iso"],
-                                "hfr_median": metrics["hfr_median"],
-                                "fwhm_arcsec": metrics["fwhm_arcsec"],
-                                "star_count": metrics["star_count"],
-                            },
-                        }
-                    )
 
                     updated_plan = self.get_plan(plan_id)
                     STATE.sequence_state.update(

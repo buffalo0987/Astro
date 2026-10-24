@@ -1,4 +1,4 @@
-const CACHE_NAME = 'astropi-pwa-v1';
+const CACHE_NAME = 'astropi-pwa-v2';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
@@ -25,11 +25,21 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws')) {
     return;
   }
+  // Network-first with offline cache fallback so software updates take effect immediately
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    fetch(event.request)
+      .then((res) => {
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy)).catch(() => {});
+        }
+        return res;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

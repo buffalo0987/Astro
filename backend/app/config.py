@@ -71,7 +71,7 @@ class AppConfig:
     astap_db_dir: str = field(
         default_factory=lambda: os.environ.get("ASTROPI_ASTAP_DB", "/opt/astap")
     )
-    astap_downsample: int = 2
+    astap_downsample: int = 0  # 0 = ASTAP automatic downsample (preserves Small Fine JPEG stars)
     astap_blind_radius_deg: float = 180.0
     astap_seeded_radius_deg: float = 15.0
     force_simulator: bool = field(

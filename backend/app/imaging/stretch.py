@@ -77,7 +77,15 @@ def compute_histogram_256(arr_u8: np.ndarray, bins: int = 64) -> Dict[str, Any]:
         r_hist, _ = np.histogram(sub[:, :, 0], bins=bins, range=(0, 256))
         g_hist, _ = np.histogram(sub[:, :, 1], bins=bins, range=(0, 256))
         b_hist, _ = np.histogram(sub[:, :, 2], bins=bins, range=(0, 256))
-        luma = (0.299 * sub[:, :, 0] + 0.587 * sub[:, :, 1] + 0.114 * sub[:, :, 2]).astype(np.uint8)
+        # Fast integer BT.601 luma avoids 3x float64 temporary arrays on ARM64 Pi 4
+        luma = (
+            (
+                77 * sub[:, :, 0].astype(np.uint16)
+                + 150 * sub[:, :, 1].astype(np.uint16)
+                + 29 * sub[:, :, 2].astype(np.uint16)
+            )
+            >> 8
+        ).astype(np.uint8)
     else:
         luma = sub if sub.ndim == 2 else sub[:, :, 0]
         r_hist, _ = np.histogram(luma, bins=bins, range=(0, 256))

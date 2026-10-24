@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 import psutil
 
+from .astrometry.astap_runner import check_astap_readiness
 from .config import CONFIG
 from .db import DB
 
@@ -45,6 +46,7 @@ class CameraTelemetry:
     capture_target: str = "Internal RAM"
     busy: bool = False
     exposing: bool = False
+    live_view_running: bool = False
     exposure_total_s: float = 0.0
     exposure_elapsed_s: float = 0.0
     exposure_remaining_s: float = 0.0
@@ -67,6 +69,8 @@ class SystemTelemetry:
     usb_drive_path: str = ""
     smb_share_url: str = r"\\astro.local\captures"
     smb_mac_url: str = "smb://astro.local/captures"
+    astap_ready: bool = False
+    astap_status: str = "Checking..."
 
 
 class StateManager:
@@ -77,6 +81,7 @@ class StateManager:
     def __init__(self) -> None:
         self.active_mode: str = "IDLE"
         self.night_vision_default: bool = False
+        self.auto_stretch_enabled: bool = True
         self.observer = ObserverState()
         self.camera = CameraTelemetry()
         self.system = SystemTelemetry(active_storage_path=str(CONFIG.captures_dir))
@@ -202,6 +207,13 @@ class StateManager:
             usage = shutil.disk_usage(storage_dir)
             self.system.disk_free_gb = round(usage.free / (1024**3), 2)
             self.system.disk_total_gb = round(usage.total / (1024**3), 2)
+        except Exception:
+            pass
+
+        try:
+            astap_info = check_astap_readiness()
+            self.system.astap_ready = bool(astap_info["ready"])
+            self.system.astap_status = str(astap_info["status"])
         except Exception:
             pass
 
