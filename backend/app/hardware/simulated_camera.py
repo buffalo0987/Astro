@@ -41,6 +41,8 @@ class SimulatedRig:
         self.camera_roll_deg: float = 12.5
         # Simulated manual focus ring position (optimal at 0.0, range -5..+5)
         self.focus_defocus_steps: float = 1.4
+        # Simulated flat light source intensity (1.0 => ~46% sRGB ADU at 0.25s @ ISO 100)
+        self.flat_panel_ev_flux: float = 1.0
         self.rng = np.random.default_rng(42)
         self._star_catalog = self._generate_star_field(65)
 
@@ -209,8 +211,18 @@ class SimulatedRig:
         elif frame_type.lower() == "flat":
             yy, xx = np.mgrid[0:h, 0:w]
             r2 = ((xx - w * 0.5) / (w * 0.6)) ** 2 + ((yy - h * 0.5) / (h * 0.6)) ** 2
-            vignette = (195.0 * (1.0 - 0.22 * r2)).clip(80, 220)
-            arr = np.stack([vignette, vignette * 0.98, vignette * 0.95], axis=-1).astype(np.uint8)
+            try:
+                iso_num = max(100.0, float(iso))
+            except (TypeError, ValueError):
+                iso_num = 100.0
+            exp_num = max(0.0001, float(exposure_s))
+            # Linear photon dose normalized so 0.25s (1/4s) @ ISO 100 at flux=1.0 -> ~46% sRGB ADU
+            linear_dose = max(0.0, float(self.flat_panel_ev_flux)) * (exp_num / 0.25) * (iso_num / 100.0)
+            linear_vig = (0.205 * linear_dose) * (1.0 - 0.22 * r2)
+            rgb_lin = np.stack([linear_vig, linear_vig * 0.96, linear_vig * 0.91], axis=-1)
+            srgb = 255.0 * (np.clip(rgb_lin, 0.0, 1.0) ** (1.0 / 2.2))
+            noise = rng.normal(loc=1.5, scale=0.8, size=(h, w, 3))
+            arr = np.clip(srgb + noise, 0, 255).astype(np.uint8)
         else:
             # Sky background + faint H-alpha nebula glow + Gaussian stars
             bg = rng.normal(loc=22.0, scale=2.0, size=(h, w, 3)).astype(np.float32)

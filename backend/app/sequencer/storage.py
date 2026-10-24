@@ -378,11 +378,14 @@ class StorageManager:
                     dec_d = p_row["target_dec_deg"]
 
         counts = {"light": 0, "dark": 0, "bias": 0, "flat": 0}
+        isos_by_type: Dict[str, set[str]] = {"light": set(), "dark": set(), "bias": set(), "flat": set()}
         total_light_exp_s = 0.0
         for fr in frames:
             ft = str(fr.get("frame_type", "")).lower()
             if ft in counts:
                 counts[ft] += 1
+                if fr.get("iso") is not None:
+                    isos_by_type[ft].add(str(fr.get("iso")).strip())
                 if ft == "light":
                     total_light_exp_s += float(fr.get("exposure_s") or 0.0)
 
@@ -431,10 +434,11 @@ class StorageManager:
             lines.append("cd flats")
             lines.append("convert flat -out=../process")
             lines.append("cd ../process")
-            if counts["bias"] > 0:
+            if counts["bias"] > 0 and isos_by_type["flat"] == isos_by_type["bias"]:
                 lines.append("calibrate flat -bias=bias_stacked")
             else:
                 # Canon EOS M200 14-bit CR3 native optical black pedestal = 2048 ADU
+                # Used when no Biases exist or when Flats use clean ISO 100 while Biases match higher Light ISO
                 lines.append('calibrate flat -bias="=2048"')
             if counts["flat"] >= 3:
                 lines.append("stack pp_flat rej 3 3 -norm=mul -out=pp_flat_stacked")

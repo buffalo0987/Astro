@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import time
 import unittest
@@ -10,6 +11,8 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
+
+os.environ.setdefault("ASTROPI_SIMULATOR", "1")
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
@@ -461,6 +464,135 @@ class TestAstroPiSuite(unittest.TestCase):
         finally:
             self.client.delete(f"/api/sessions/{target_sess['id']}")
             self.client.delete("/api/sequence/plans/plan_test_siril_ssf")
+
+    def test_09_auto_flat_calibration_wizard_and_siril_iso_matching(self) -> None:
+        """Verify 1-tap Auto-Flat exposure/ISO solver across bright, standard, dim/dual-band, PWM flicker, and capped-lens regimes."""
+        # 1. Standard dimmed tablet / T-shirt panel (sim_flat_flux=1.0 -> ~1/4s @ ISO 100)
+        r_std = self.client.post("/api/camera/auto-flat", json={"sim_flat_flux": 1.0})
+        self.assertEqual(r_std.status_code, 200)
+        d_std = r_std.json()
+        self.assertTrue(d_std["converged"])
+        self.assertEqual(d_std["iso"], "100")
+        self.assertGreaterEqual(d_std["adu_pct"], 35)
+        self.assertLessEqual(d_std["adu_pct"], 55)
+        self.assertLess(d_std["max_channel_p99_adu"], 242.0)
+        self.assertFalse(d_std["flicker_warning"])
+        self.assertLessEqual(d_std["iterations"], 3)
+        # Camera must be guaranteed back in RAW (.CR3)
+        self.assertEqual(self.client.get("/api/camera/status").json()["image_format"], "RAW (.CR3)")
+
+        # 2. Bright iPad screen (sim_flat_flux=25.0 -> starts saturated at 0.1s, drops to ~1/80s-1/100s @ ISO 100)
+        r_bright = self.client.post("/api/camera/auto-flat", json={"sim_flat_flux": 25.0})
+        self.assertEqual(r_bright.status_code, 200)
+        d_bright = r_bright.json()
+        self.assertTrue(d_bright["converged"])
+        self.assertEqual(d_bright["iso"], "100")
+        self.assertLess(d_bright["exposure_s"], 0.03)
+        self.assertGreaterEqual(d_bright["adu_pct"], 35)
+        self.assertLessEqual(d_bright["adu_pct"], 55)
+        self.assertFalse(d_bright["flicker_warning"])
+
+        # 3. Ultra-bright undimmed LED panel (sim_flat_flux=150.0 -> <1/250s, warns about PWM rolling-shutter flicker)
+        r_pwm = self.client.post("/api/camera/auto-flat", json={"sim_flat_flux": 150.0})
+        self.assertEqual(r_pwm.status_code, 200)
+        d_pwm = r_pwm.json()
+        self.assertTrue(d_pwm["converged"])
+        self.assertEqual(d_pwm["iso"], "100")
+        self.assertLess(d_pwm["exposure_s"], 0.004)
+        self.assertTrue(d_pwm["flicker_warning"])
+
+        # 4. Dim Dual-Band H-alpha/OIII filter on panel (sim_flat_flux=0.04 -> steps ISO up above 100 to keep exp <= 2s)
+        r_dim = self.client.post("/api/camera/auto-flat", json={"sim_flat_flux": 0.04})
+        self.assertEqual(r_dim.status_code, 200)
+        d_dim = r_dim.json()
+        self.assertTrue(d_dim["converged"])
+        self.assertGreater(int(d_dim["iso"]), 100)
+        self.assertLessEqual(d_dim["exposure_s"], 2.0)
+        self.assertGreaterEqual(d_dim["adu_pct"], 35)
+        self.assertLessEqual(d_dim["adu_pct"], 55)
+
+        # 5. Forgotten lens cap (sim_flat_flux=0.0 -> reports too_dim cleanly without hanging)
+        r_cap = self.client.post("/api/camera/auto-flat", json={"sim_flat_flux": 0.0})
+        self.assertEqual(r_cap.status_code, 200)
+        d_cap = r_cap.json()
+        self.assertFalse(d_cap["converged"])
+        self.assertTrue(d_cap["too_dim"])
+
+        # 6. End-to-end sequence integration: Auto-Flat during Flat Interlock + ISO-aware Siril .ssf generation
+        plan_resp = self.client.post(
+            "/api/sequence/plans",
+            json={
+                "id": "plan_test_autoflat_seq",
+                "name": "Test AutoFlat Interlock & Siril ISO",
+                "target_name": "AutoFlat_NGC7000",
+                "target_ra_hours": 20.988,
+                "target_dec_deg": 44.33,
+                "steps": [
+                    {"frame_type": "Light", "exposure_s": 1.0, "iso": "800", "total_count": 2, "cooldown_s": 0.05},
+                    {"frame_type": "Bias", "exposure_s": 0.001, "iso": "800", "total_count": 2, "cooldown_s": 0.05},
+                    {"frame_type": "Flat", "exposure_s": 1.0, "iso": "800", "total_count": 2, "cooldown_s": 0.05},
+                ],
+            },
+        )
+        self.assertEqual(plan_resp.status_code, 200)
+        self.assertEqual(
+            self.client.post("/api/sequence/plans/plan_test_autoflat_seq/start", json={"reset_progress": True}).status_code,
+            200,
+        )
+
+        # Confirm Bias interlock first
+        for _ in range(50):
+            s_state = self.client.get("/api/system/state").json()["sequence"]
+            if s_state["status"] == "AWAITING_INTERLOCK":
+                break
+            self.client._loop.run_until_complete(__import__("asyncio").sleep(0.08))
+        self.assertEqual(s_state["interlock_type"], "Bias")
+        self.assertEqual(self.client.post("/api/sequence/confirm-interlock", json={}).status_code, 200)
+
+        # Wait for Flat interlock, run Auto-Flat right during the interlock pause, and apply both exposure_s & iso
+        for _ in range(50):
+            s_state = self.client.get("/api/system/state").json()["sequence"]
+            if s_state["status"] == "AWAITING_INTERLOCK" and s_state["interlock_type"] == "Flat":
+                break
+            self.client._loop.run_until_complete(__import__("asyncio").sleep(0.08))
+        self.assertEqual(s_state["interlock_type"], "Flat")
+
+        af_live = self.client.post("/api/camera/auto-flat", json={"sim_flat_flux": 1.0}).json()
+        self.assertTrue(af_live["converged"])
+        self.assertEqual(af_live["iso"], "100")
+
+        self.assertEqual(
+            self.client.post(
+                "/api/sequence/confirm-interlock",
+                json={"exposure_s": af_live["exposure_s"], "iso": af_live["iso"]},
+            ).status_code,
+            200,
+        )
+
+        for _ in range(50):
+            s_state = self.client.get("/api/system/state").json()["sequence"]
+            if s_state["status"] == "COMPLETED":
+                break
+            self.client._loop.run_until_complete(__import__("asyncio").sleep(0.08))
+        self.assertEqual(s_state["status"], "COMPLETED")
+
+        sess_list = self.client.get("/api/sessions").json()["sessions"]
+        target_sess = next(s for s in sess_list if "AutoFlat_NGC7000" in s["id"])
+        try:
+            flat_frames = [f for f in target_sess["frames"] if f["frame_type"] == "Flat"]
+            self.assertEqual(len(flat_frames), 2)
+            self.assertAlmostEqual(float(flat_frames[0]["exposure_s"]), float(af_live["exposure_s"]), places=4)
+            self.assertEqual(str(flat_frames[0]["iso"]), "100")
+
+            # Since Biases are ISO 800 and Auto-Flats used clean ISO 100, siril_stack.ssf must build bias_stacked
+            # for Lights while calibrating ISO 100 Flats with Canon's exact '=2048' pedestal!
+            ssf_text = self.client.get(f"/api/sessions/{target_sess['id']}/siril_stack.ssf").text
+            self.assertIn("stack bias rej none -nonorm -out=bias_stacked", ssf_text)
+            self.assertIn('calibrate flat -bias="=2048"', ssf_text)
+            self.assertIn("calibrate light -bias=bias_stacked -flat=pp_flat_stacked", ssf_text)
+        finally:
+            self.client.delete(f"/api/sessions/{target_sess['id']}")
+            self.client.delete("/api/sequence/plans/plan_test_autoflat_seq")
 
 
 if __name__ == "__main__":

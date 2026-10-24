@@ -40,6 +40,9 @@
     manualIso: '1600',
     histMode: 'AUTO', // 'AUTO' | 'LIGHT' | 'FLAT'
     flatCalibratedExp: null,
+    flatCalibratedIso: null,
+    flatCalibratedLabel: null,
+    lastAutoFlat: null,
     notice: null,
     busyAction: null,
   };
@@ -1212,19 +1215,35 @@
                    sequence.interlock_type === 'Flat'
                      ? (() => {
                          const fEval = evaluateFlatHistogram(store.state?.preview?.histogram);
-                         const flatIso = sequence.pending_step_iso || '100';
+                         const flatIso = store.flatCalibratedIso || sequence.pending_step_iso || '100';
                          const curExpOpt = PREVIEW_EXP_OPTIONS.find((o) => Number(o.val) === Number(store.manualExposure));
                          const expLabel = curExpOpt ? curExpOpt.label : `${store.manualExposure}s`;
                          return `
                            <div style="background:var(--bg-oled);border:1px solid var(--border-col);border-radius:6px;padding:8px 10px;font-size:12px;display:grid;gap:6px">
                              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
                                <span><strong>Siril Flat ADU Check (Target 35–55%):</strong> ${fEval.label}</span>
-                               <button class="btn btn-sm" data-action="flat-test-shot" ${store.busyAction ? 'disabled' : ''}>
-                                 ${store.busyAction === 'flat-test-shot' ? '⏳ Measuring Flat...' : `📸 Test Flat (${expLabel} @ ISO ${flatIso})`}
-                               </button>
+                               <div style="display:flex;gap:6px;flex-wrap:wrap">
+                                 <button class="btn btn-sm btn-primary" data-action="seq-auto-flat" ${store.busyAction ? 'disabled' : ''}>
+                                   ${store.busyAction === 'auto-flat' ? '⏳ Auto-Calibrating...' : '⚡ Auto-Calibrate Flat'}
+                                 </button>
+                                 <button class="btn btn-sm" data-action="flat-test-shot" ${store.busyAction ? 'disabled' : ''}>
+                                   ${store.busyAction === 'flat-test-shot' ? '⏳ Measuring...' : `📸 Manual Test (${expLabel} @ ISO ${flatIso})`}
+                                 </button>
+                               </div>
                              </div>
+                             ${
+                               store.lastAutoFlat && store.lastAutoFlat.flicker_warning
+                                 ? `<div style="color:var(--warn-col);font-size:11px">
+                                      ⚠️ <strong>PWM Flicker Note (&lt;1/250s):</strong> Dim your screen/panel or add a layer of folded white T-shirt/paper to avoid horizontal LED banding.
+                                    </div>`
+                                 : ''
+                             }
                              <div style="font-size:11px;color:var(--text-muted)">
-                               Adjust <strong>EXP</strong> on the Live Sky Preview bar and tap <strong>Test Flat</strong> until ADU lands in <strong>35–55%</strong>${store.flatCalibratedExp !== null ? ` (Will run Flats at calibrated <strong>${store.flatCalibratedExp}s</strong> ✓)` : ''}.
+                               ${
+                                 store.flatCalibratedExp !== null
+                                   ? `<strong style="color:var(--ok-col)">✓ Calibrated Flat Ready:</strong> Will shoot Flats at <strong>${store.flatCalibratedLabel || `${store.flatCalibratedExp}s`} @ ISO ${flatIso}</strong> when you confirm below.`
+                                   : 'Tap <strong>⚡ Auto-Calibrate Flat</strong> to automatically solve best shutter speed &amp; ISO for 35–55% ADU (or use Manual Test).'
+                               }
                              </div>
                            </div>
                          `;
@@ -1308,13 +1327,29 @@
             <div style="font-size:12px;font-weight:800;color:var(--text-muted)">
               SEQUENCE PLAN STEPS (AUTO-SWITCHES TO .CR3 RAW; &gt;30s USES EOS BULB TIMER)
             </div>
-            <div style="display:flex;gap:6px">
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button
+                class="btn btn-sm"
+                data-action="seq-auto-flat"
+                ${store.busyAction || sequence.status === 'RUNNING' ? 'disabled' : ''}
+                title="Point at your flat panel / twilight T-shirt and automatically solve best Flat exposure &amp; ISO (35–55% ADU)"
+              >
+                ${store.busyAction === 'auto-flat' ? '⏳ Auto-Calibrating...' : '⚡ Auto-Calibrate Flat'}
+              </button>
               <button class="btn btn-sm" data-action="seq-add-step">+ Add Step</button>
               <button class="btn btn-sm ${store.planSavedBanner ? 'btn-ok' : ''}" data-action="seq-save-plan">
                 ${store.planSavedBanner ? 'Saved ✓' : 'Save Plan'}
               </button>
             </div>
           </div>
+
+          ${
+            store.lastAutoFlat && store.lastAutoFlat.converged && !sequence.interlock_required
+              ? `<div style="font-size:11px;padding:6px 10px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--border-col);color:${store.lastAutoFlat.flicker_warning ? 'var(--warn-col)' : 'var(--ok-col)'}">
+                   ⚡ <strong>Auto-Flat Applied:</strong> ${store.lastAutoFlat.shutter_label} (${store.lastAutoFlat.exposure_s}s) @ ISO ${store.lastAutoFlat.iso} → <strong>${store.lastAutoFlat.adu_pct}% ADU</strong> (${store.lastAutoFlat.iterations} probe${store.lastAutoFlat.iterations === 1 ? '' : 's'}, unclipped)${store.lastAutoFlat.flicker_warning ? ' — ⚠️ Faster than 1/250s; dim screen or add T-shirt layer to avoid LED banding.' : ''}
+                 </div>`
+              : ''
+          }
 
           <div style="overflow-x:auto">
             <table class="step-table">
@@ -2196,27 +2231,68 @@
       } else if (act === 'seq-resume') {
         await api('/api/sequence/resume', 'POST');
         await refreshAll();
+      } else if (act === 'seq-auto-flat') {
+        store.busyAction = 'auto-flat';
+        store.histMode = 'FLAT';
+        render();
+        const res = await api('/api/camera/auto-flat', 'POST', {});
+        store.lastAutoFlat = res;
+        if (res.converged) {
+          store.flatCalibratedExp = Number(res.exposure_s);
+          store.flatCalibratedIso = String(res.iso);
+          store.flatCalibratedLabel = res.shutter_label || `${res.exposure_s}s`;
+          if (!store.editingSteps) store.editingSteps = [];
+          let updatedFlatStep = false;
+          for (const st of store.editingSteps) {
+            if (st.frame_type === 'Flat') {
+              st.exposure_s = Number(res.exposure_s);
+              st.iso = String(res.iso);
+              updatedFlatStep = true;
+            }
+          }
+          if (!updatedFlatStep && store.state?.sequence?.status !== 'AWAITING_INTERLOCK') {
+            store.editingSteps.push({
+              frame_type: 'Flat',
+              exposure_s: Number(res.exposure_s),
+              iso: String(res.iso),
+              total_count: 20,
+              cooldown_s: 1.0,
+            });
+          }
+          store.planSavedBanner = false;
+          await refreshAll();
+          showNotice(res.message, res.flicker_warning ? 'warn' : 'ok', res.flicker_warning ? 12000 : 8000);
+        } else {
+          await refreshAll();
+          showNotice(res.message || 'Auto-Flat could not reach 35–55% ADU.', 'warn', 12000);
+        }
       } else if (act === 'flat-test-shot') {
         store.busyAction = 'flat-test-shot';
         store.histMode = 'FLAT';
         render();
-        const flatIso = String(store.state?.sequence?.pending_step_iso || '100');
+        const flatIso = String(store.flatCalibratedIso || store.state?.sequence?.pending_step_iso || '100');
         await api('/api/camera/capture', 'POST', {
           exposure_s: expVal,
           iso: flatIso,
+          frame_type: 'Flat',
           fast_jpeg: true,
           auto_stretch: false,
         });
         store.flatCalibratedExp = expVal;
+        store.flatCalibratedIso = flatIso;
+        store.flatCalibratedLabel = null;
         await refreshAll();
         const fEval = evaluateFlatHistogram(store.state?.preview?.histogram);
         showNotice(`Flat Test (${expVal}s @ ISO ${flatIso}): ${fEval.pct}% ADU — ${fEval.label}`, fEval.ok ? 'ok' : 'warn', 8000);
       } else if (act === 'seq-confirm-interlock') {
         const confirmPayload = {};
-        if (store.state?.sequence?.interlock_type === 'Flat' && store.flatCalibratedExp !== null) {
-          confirmPayload.exposure_s = Number(store.flatCalibratedExp);
+        if (store.state?.sequence?.interlock_type === 'Flat') {
+          if (store.flatCalibratedExp !== null) confirmPayload.exposure_s = Number(store.flatCalibratedExp);
+          if (store.flatCalibratedIso !== null) confirmPayload.iso = String(store.flatCalibratedIso);
         }
         store.flatCalibratedExp = null;
+        store.flatCalibratedIso = null;
+        store.flatCalibratedLabel = null;
         if (store.histMode === 'FLAT') store.histMode = 'AUTO';
         await api('/api/sequence/confirm-interlock', 'POST', confirmPayload);
         await refreshAll();

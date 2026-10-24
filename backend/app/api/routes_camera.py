@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import CONFIG
-from ..hardware.camera_actor import CAMERA
+from ..hardware.camera_actor import (
+    CAMERA,
+    format_canon_shutter_label,
+    parse_canon_shutter_choice,
+)
+from ..hardware.simulated_camera import SIM_RIG
 from ..imaging.pipeline import LAST_UNSTRETCHED_PATH, process_and_publish_preview
 from ..state import STATE
 from ..web_compat import APIRouter, FileResponse, HTTPException, Response
@@ -194,12 +200,14 @@ async def capture_manual_preview(payload: Dict[str, Any] = None) -> Dict[str, An
     body = payload or {}
     exposure_s = float(body.get("exposure_s", 2.0))
     iso = str(body.get("iso", "800"))
+    frame_type = str(body.get("frame_type", "Light"))
     fast_jpeg = bool(body.get("fast_jpeg", True))
     enable_stretch = (
         bool(body["auto_stretch"]) if "auto_stretch" in body else STATE.auto_stretch_enabled
     )
     tier2_linear = bool(body.get("tier2_linear", False))
     restore_raw_after = bool(body.get("restore_raw_after", True))
+    is_flat = frame_type.lower() == "flat"
 
     ext = ".jpg" if fast_jpeg else ".CR3"
     out_file = CONFIG.shm_dir / f"manual_shot{ext}"
@@ -210,20 +218,20 @@ async def capture_manual_preview(payload: Dict[str, Any] = None) -> Dict[str, An
             exposure_s=exposure_s,
             iso=iso,
             fast_jpeg=fast_jpeg,
-            frame_type="Light",
-            mode=STATE.active_mode,
+            frame_type=frame_type,
+            mode="FLAT" if is_flat else STATE.active_mode,
             max_retries=1,
         )
         preview, metrics = await process_and_publish_preview(
             source_path=out_file,
             max_dim=1500,
             enable_stretch=enable_stretch,
-            compute_hfr=True,
+            compute_hfr=not is_flat,
             tier2_linear=tier2_linear,
             jpeg_quality=86,
             source_label="Small Fine JPEG" if fast_jpeg else None,
-            max_overlay_stars=20,
-            meta={"exposure_s": exposure_s, "iso": iso},
+            max_overlay_stars=0 if is_flat else 20,
+            meta={"exposure_s": exposure_s, "iso": iso, "frame_type": frame_type},
             broadcast=True,
         )
         return {"preview": preview, "metrics": metrics}
@@ -232,6 +240,266 @@ async def capture_manual_preview(payload: Dict[str, Any] = None) -> Dict[str, An
     finally:
         if restore_raw_after:
             await CAMERA.ensure_raw_format()
+
+
+@router.post("/auto-flat")
+async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Automatically solve optimal Flat shutter speed & ISO (35-55% unstretched ADU, unclipped).
+
+    Starts at clean ISO 100 by default, uses inverse-gamma (2.2) proportional jumps snapped to
+    physical Canon EOS M200 1/3-stop shutter choices, steps ISO up only when dimmer panels or
+    dual-band filters would exceed max_exposure_s, warns on PWM screen flicker (<1/250s), and
+    guarantees restoration to RAW (.CR3).
+    """
+    if STATE.camera.exposing or (
+        STATE.active_mode == "SEQUENCE" and STATE.sequence_state.get("status") == "RUNNING"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot run Auto-Flat calibration while an exposure or imaging sequence is actively running.",
+        )
+
+    body = payload or {}
+    iso_ladder = ("100", "200", "400", "800", "1600")
+    lock_iso = bool(body.get("lock_iso", False))
+    preferred_iso = str(body.get("preferred_iso", "100")).strip()
+    cur_iso = preferred_iso if (lock_iso and preferred_iso in iso_ladder) else "100"
+
+    target_pct = max(38.0, min(52.0, float(body.get("target_adu_pct", 45.0))))
+    target_adu = 255.0 * (target_pct / 100.0)
+    max_exposure_per_iso_s = max(0.5, min(10.0, float(body.get("max_exposure_s", 2.0))))
+    hard_max_exposure_s = max(max_exposure_per_iso_s, min(15.0, float(body.get("hard_max_exposure_s", 4.0))))
+    max_iterations = max(2, min(8, int(body.get("max_iterations", 6))))
+    flicker_safe_floor_s = 0.004  # 1/250s PWM LED flicker threshold
+
+    await stop_live_loop_quietly()
+    try:
+        from .routes_framing import stop_focus_loop
+        from .routes_pa import stop_pa_live_loop
+
+        if STATE.pa_state.get("loop_running"):
+            await stop_pa_live_loop({"restore_raw": False})
+        if STATE.focus_state.get("loop_running"):
+            await stop_focus_loop()
+    except Exception:
+        pass
+
+    raw_choices = await CAMERA.get_shutter_choices()
+    parsed_choices: List[Tuple[float, str]] = []
+    seen_secs: set[float] = set()
+    for ch in raw_choices:
+        sec = parse_canon_shutter_choice(ch)
+        if sec is not None and 0.0001 <= sec <= hard_max_exposure_s * 1.05:
+            key = round(sec, 7)
+            if key not in seen_secs:
+                seen_secs.add(key)
+                parsed_choices.append((sec, ch))
+    parsed_choices.sort(key=lambda item: item[0])
+    if not parsed_choices:
+        parsed_choices = [(0.25, "1/4")]
+
+    cur_exp_s = max(parsed_choices[0][0], min(0.25, float(body.get("start_exposure_s", 0.1))))
+    tested_pairs: set[Tuple[str, str]] = set()
+    history: List[Dict[str, Any]] = []
+    converged = False
+    too_bright = False
+    too_dim = False
+    best_entry: Optional[Dict[str, Any]] = None
+    last_snapped_exp: Optional[float] = None
+    last_desired_exp: Optional[float] = None
+
+    prev_sim_flux = SIM_RIG.flat_panel_ev_flux
+    has_sim_override = (
+        STATE.camera.driver_mode == "simulator"
+        and "sim_flat_flux" in body
+        and body["sim_flat_flux"] is not None
+    )
+    if has_sim_override:
+        SIM_RIG.flat_panel_ev_flux = max(0.0, float(body["sim_flat_flux"]))
+
+    out_file = CONFIG.shm_dir / "auto_flat_probe.jpg"
+
+    try:
+        for step_num in range(1, max_iterations + 1):
+            best_idx = min(
+                range(len(parsed_choices)),
+                key=lambda i: abs(math.log(parsed_choices[i][0] / max(1e-6, cur_exp_s))),
+            )
+            if (cur_iso, parsed_choices[best_idx][1]) in tested_pairs:
+                if last_desired_exp is not None and last_snapped_exp is not None:
+                    if last_desired_exp > last_snapped_exp and best_idx + 1 < len(parsed_choices):
+                        best_idx += 1
+                    elif last_desired_exp < last_snapped_exp and best_idx - 1 >= 0:
+                        best_idx -= 1
+                if (cur_iso, parsed_choices[best_idx][1]) in tested_pairs:
+                    break
+
+            raw_sec, choice_str = parsed_choices[best_idx]
+            snapped_exp_s = round(raw_sec, 6)
+            shutter_label = format_canon_shutter_label(choice_str, snapped_exp_s)
+            tested_pairs.add((cur_iso, choice_str))
+
+            await CAMERA.capture_frame(
+                output_path=out_file,
+                exposure_s=snapped_exp_s,
+                iso=cur_iso,
+                fast_jpeg=True,
+                frame_type="Flat",
+                mode="FLAT",
+                max_retries=1,
+            )
+            preview, _ = await process_and_publish_preview(
+                source_path=out_file,
+                max_dim=1500,
+                enable_stretch=False,
+                compute_hfr=False,
+                jpeg_quality=85,
+                source_label="Auto-Flat Probe (S1)",
+                max_overlay_stars=0,
+                meta={
+                    "exposure_s": snapped_exp_s,
+                    "shutter_label": shutter_label,
+                    "iso": cur_iso,
+                    "frame_type": "Flat",
+                    "auto_flat_step": step_num,
+                },
+                broadcast=True,
+            )
+            hist = preview.get("histogram") or {}
+            med_adu = float(hist.get("median_adu", 0.0))
+            max_ch_p99 = float(hist.get("max_channel_p99_adu", hist.get("p99_adu", 0.0)))
+            adu_pct = round((med_adu / 255.0) * 100.0, 1)
+
+            entry = {
+                "step": step_num,
+                "iso": cur_iso,
+                "exposure_s": snapped_exp_s,
+                "shutter_label": shutter_label,
+                "choice": choice_str,
+                "median_adu": med_adu,
+                "adu_pct": adu_pct,
+                "max_channel_p99_adu": max_ch_p99,
+            }
+            history.append(entry)
+
+            in_sweet_spot = (36.0 <= adu_pct <= 54.0) and (max_ch_p99 < 240.0)
+            if in_sweet_spot and not ((not lock_iso) and int(cur_iso) > 100 and snapped_exp_s < flicker_safe_floor_s):
+                converged = True
+                best_entry = entry
+                break
+
+            # Proportional inverse-gamma (2.2) solver with saturation/pedestal guards
+            if med_adu >= 240.0:
+                ratio = 0.125
+            elif max_ch_p99 >= 240.0 or med_adu >= 225.0:
+                ratio = 0.28
+            elif med_adu < 8.0:
+                ratio = 12.0
+            else:
+                ratio = max(0.08, min(16.0, (target_adu / med_adu) ** 2.2))
+
+            desired_exp = snapped_exp_s * ratio
+            next_iso = cur_iso
+            if not lock_iso:
+                iso_idx = iso_ladder.index(cur_iso)
+                while desired_exp > max_exposure_per_iso_s and iso_idx + 1 < len(iso_ladder):
+                    iso_idx += 1
+                    desired_exp /= 2.0
+                while desired_exp < 0.02 and iso_idx > 0:
+                    iso_idx -= 1
+                    desired_exp *= 2.0
+                next_iso = iso_ladder[iso_idx]
+
+            # Detect physical shutter/ISO limits before taking redundant boundary exposures
+            if (
+                best_idx == 0
+                and next_iso == cur_iso
+                and desired_exp < snapped_exp_s * 0.92
+                and (adu_pct > 55.0 or max_ch_p99 >= 242.0)
+            ):
+                too_bright = True
+                break
+
+            if (
+                best_idx == len(parsed_choices) - 1
+                and next_iso == cur_iso
+                and desired_exp > snapped_exp_s * 1.08
+                and adu_pct < 35.0
+            ):
+                too_dim = True
+                break
+
+            last_snapped_exp = snapped_exp_s if next_iso == cur_iso else None
+            last_desired_exp = desired_exp if next_iso == cur_iso else None
+            cur_iso = next_iso
+            cur_exp_s = max(parsed_choices[0][0], min(hard_max_exposure_s, desired_exp))
+
+        if best_entry is None and history:
+            valid_entries = [
+                h for h in history if 35 <= round(h["adu_pct"]) <= 55 and h["max_channel_p99_adu"] < 242.0
+            ]
+            if valid_entries:
+                converged = True
+                best_entry = min(valid_entries, key=lambda h: abs(h["adu_pct"] - target_pct))
+            else:
+                unclipped = [h for h in history if h["max_channel_p99_adu"] < 242.0]
+                pool = unclipped if unclipped else history
+                best_entry = min(pool, key=lambda h: abs(h["adu_pct"] - target_pct))
+
+        assert best_entry is not None
+        flicker_warning = bool(converged and best_entry["exposure_s"] < flicker_safe_floor_s)
+        adu_pct_int = int(round(best_entry["adu_pct"]))
+
+        if converged and flicker_warning:
+            message = (
+                f"Auto-Flat solved {best_entry['shutter_label']} @ ISO {best_entry['iso']} ({adu_pct_int}% ADU), "
+                "but shutter is faster than 1/250s — dim your screen/panel or add a white T-shirt layer to avoid PWM LED banding."
+            )
+        elif converged:
+            message = (
+                f"Auto-Flat calibrated: {best_entry['shutter_label']} @ ISO {best_entry['iso']} "
+                f"({adu_pct_int}% ADU in {len(history)} shot{'s' if len(history) != 1 else ''}, zero clipping)."
+            )
+        elif too_bright:
+            message = (
+                f"Light source is too bright even at {best_entry['shutter_label']} @ ISO {best_entry['iso']} "
+                f"({adu_pct_int}% ADU)! Dim your screen/panel or add folded white T-shirt / paper layers."
+            )
+        elif too_dim:
+            message = (
+                f"Light source is too dim even at {best_entry['shutter_label']} @ ISO {best_entry['iso']} "
+                f"({adu_pct_int}% ADU)! Check that the lens cap is OFF and brighten your flat panel."
+            )
+        else:
+            message = (
+                f"Closest Flat setting after {len(history)} probes: {best_entry['shutter_label']} @ ISO {best_entry['iso']} "
+                f"({adu_pct_int}% ADU)."
+            )
+
+        return {
+            "converged": converged,
+            "exposure_s": best_entry["exposure_s"],
+            "shutter_label": best_entry["shutter_label"],
+            "iso": best_entry["iso"],
+            "median_adu": best_entry["median_adu"],
+            "adu_pct": adu_pct_int,
+            "max_channel_p99_adu": best_entry["max_channel_p99_adu"],
+            "iterations": len(history),
+            "flicker_warning": flicker_warning,
+            "too_bright": too_bright,
+            "too_dim": too_dim,
+            "message": message,
+            "history": history,
+            "preview": STATE.latest_preview,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Auto-Flat error: {exc}")
+    finally:
+        if has_sim_override:
+            SIM_RIG.flat_panel_ev_flux = prev_sim_flux
+        await CAMERA.ensure_raw_format()
 
 
 @router.get("/preview.jpg")

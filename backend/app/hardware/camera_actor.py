@@ -91,6 +91,25 @@ def select_best_canon_shutter_choice(choices: Sequence[str], exposure_s: float) 
     return best_choice
 
 
+# Verified physical Canon EOS M200 (04a9:32ef) 1/3-stop discrete shutter speeds
+CANON_M200_SHUTTER_CHOICES: tuple[str, ...] = (
+    "30", "25", "20", "15", "13", "10.3", "8", "6.3", "5", "4",
+    "3.2", "2.5", "2", "1.6", "1.3", "1", "0.8", "0.6", "0.5", "0.4", "0.3",
+    "1/4", "1/5", "1/6", "1/8", "1/10", "1/13", "1/15", "1/20", "1/25", "1/30",
+    "1/40", "1/50", "1/60", "1/80", "1/100", "1/125", "1/160", "1/200", "1/250",
+    "1/320", "1/400", "1/500", "1/640", "1/800", "1/1000", "1/1250", "1/1600",
+    "1/2000", "1/2500", "1/3200", "1/4000",
+)
+
+
+def format_canon_shutter_label(choice: str, exposure_s: float) -> str:
+    """Format a Canon shutter choice into a clean human-readable label (e.g., '1/80s', '0.5s')."""
+    ch = choice.strip()
+    if "/" in ch:
+        return ch if ch.lower().endswith("s") else f"{ch}s"
+    return f"{exposure_s:g}s"
+
+
 class CameraController:
     """Single-daemon camera controller serialized through a 1-worker thread executor."""
 
@@ -420,6 +439,30 @@ class CameraController:
         res = await loop.run_in_executor(self._executor, self._set_shutter_speed_sync, exposure_s)
         await STATE.broadcast("CAMERA_STATUS", self.status_dict())
         return res
+
+    def _get_shutter_choices_sync(self) -> List[str]:
+        if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None and gp is not None:
+            try:
+                cfg = self._gp_get_config()
+                ok, widget = gp.gp_widget_get_child_by_name(cfg, "shutterspeed")
+                if ok >= gp.GP_OK:
+                    choices = [
+                        widget.get_choice(i)
+                        for i in range(widget.count_choices())
+                        if parse_canon_shutter_choice(widget.get_choice(i)) is not None
+                    ]
+                    if choices:
+                        return choices
+            except Exception:
+                pass
+        return list(CANON_M200_SHUTTER_CHOICES)
+
+    async def get_shutter_choices(self) -> List[str]:
+        """Return discrete non-Bulb shutter speed choices supported by the active camera."""
+        if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._executor, self._get_shutter_choices_sync)
+        return list(CANON_M200_SHUTTER_CHOICES)
 
     def _set_image_format_sync(self, fast_jpeg: bool) -> str:
         """Switch camera between Small Fine JPEG (fast-solve loop) and RAW (.CR3)."""
