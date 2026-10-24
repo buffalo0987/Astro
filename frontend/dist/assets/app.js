@@ -1471,7 +1471,7 @@
                      ⚡ Connect Camera (Simulator Mode)
                    </button>`
                 : `<span class="badge badge-raw" style="background:#0e4429;border-color:#3fb950;color:#3fb950;font-weight:700">
-                     🟢 ${camera.model || 'Canon EOS M200 (USB PTP)'}
+                     🟢 ${camera.model || 'Canon EOS M200 (USB PTP)'}${camera.battery_pct !== undefined ? ` • 🔋 ${camera.battery_pct}%` : ''}
                    </span>`
             }
             <span class="badge ${camera.is_fast_jpg_mode ? 'badge-jpg' : 'badge-raw'}">

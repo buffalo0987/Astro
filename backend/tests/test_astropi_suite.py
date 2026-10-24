@@ -322,6 +322,18 @@ class TestAstroPiSuite(unittest.TestCase):
         self.assertEqual(select_best_canon_shutter_choice(canon_choices, 1.5), "1.6")
         self.assertEqual(select_best_canon_shutter_choice(canon_choices, 30.0), "30")
 
+        # Canon EOS M200 imageformat list must prefer 'S1' (6MP Fine JPEG) and 'RAW', never 'RAW + L'
+        m200_formats = [
+            "L", "cL", "M", "cM", "S1", "cS1", "S2",
+            "RAW + L", "RAW + S1", "cRAW + L", "RAW", "cRAW",
+        ]
+        from app.hardware.camera_actor import CameraController
+        non_raw = [c for c in m200_formats if "raw" not in c.lower()]
+        picked_jpg = next(
+            c for cand in CameraController.FAST_JPEG_CANDIDATES for c in non_raw if cand.lower() == c.lower()
+        )
+        self.assertEqual(picked_jpg, "S1")
+
         # Preview endpoint returns 404 without firing shutter when no preview exists
         preview_file = CONFIG.shm_dir / "latest_preview.jpg"
         if preview_file.exists():

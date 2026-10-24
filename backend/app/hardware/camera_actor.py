@@ -94,14 +94,18 @@ def select_best_canon_shutter_choice(choices: Sequence[str], exposure_s: float) 
 class CameraController:
     """Single-daemon camera controller serialized through a 1-worker thread executor."""
 
-    RAW_FORMAT_CANDIDATES = ("RAW", "CR3", "cRAW", "RAW + Large Fine JPEG")
+    RAW_FORMAT_CANDIDATES = ("RAW", "CR3", "cRAW")
     FAST_JPEG_CANDIDATES = (
+        "S1",
         "Small Fine JPEG",
         "S1 Fine",
+        "cS1",
         "Small Normal JPEG",
-        "S2",
+        "M",
         "Medium Fine JPEG",
         "M Fine",
+        "S2",
+        "L",
         "Large Fine JPEG",
     )
 
@@ -197,11 +201,17 @@ class CameraController:
                 cam.init(ctx)
             self._gp_context = ctx
             self._gp_camera = cam
+            # Ensure camera isn't stuck in an unclosed Bulb exposure or EVF mode
+            self._release_bulb_sync()
+            self._exit_live_view_sync()
             self._set_widget_sync("autopoweroff", ("0", "Off", "Disable"))
+            self._set_widget_sync("drivemode", ("Single", "Single-Frame Shooting"))
+            self._set_widget_sync("syncdatetimeutc", (1,))
             # Critical for cardless Canon EOS M200 operation: default to Internal RAM
             self._set_widget_sync("capturetarget", ("Internal RAM", "RAM"))
             self._discover_format_labels_sync()
             self._set_image_format_sync(fast_jpeg=False)
+            self._refresh_battery_sync()
 
             STATE.camera.connected = True
             STATE.camera.driver_mode = "gphoto2"
@@ -216,6 +226,19 @@ class CameraController:
             STATE.camera.last_error = f"USB PTP: {exc}. Ensure camera is ON in Manual (M) mode."
             return False
 
+    def _refresh_battery_sync(self) -> None:
+        if self._gp_camera is None or gp is None:
+            return
+        try:
+            cfg = self._gp_get_config()
+            ok, widget = gp.gp_widget_get_child_by_name(cfg, "batterylevel")
+            if ok >= gp.GP_OK:
+                raw_val = str(widget.get_value()).strip().rstrip("%").strip()
+                if raw_val.isdigit():
+                    STATE.camera.battery_pct = max(0, min(100, int(raw_val)))
+        except Exception:
+            pass
+
     def _discover_format_labels_sync(self) -> None:
         if self._gp_camera is None or gp is None:
             return
@@ -227,7 +250,7 @@ class CameraController:
                 found_raw = False
                 for cand in self.RAW_FORMAT_CANDIDATES:
                     for ch in choices:
-                        if cand.lower() == ch.lower():
+                        if cand.lower() == ch.strip().lower():
                             self._raw_format_label = ch
                             found_raw = True
                             break
@@ -235,29 +258,62 @@ class CameraController:
                         break
                 if not found_raw:
                     for ch in choices:
-                        if "raw" in ch.lower() and "jpeg" not in ch.lower():
+                        ch_low = ch.lower()
+                        if "raw" in ch_low and "+" not in ch_low and "jpeg" not in ch_low:
                             self._raw_format_label = ch
                             break
 
+                non_raw_choices = [ch for ch in choices if "raw" not in ch.lower()]
                 found_jpg = False
+                # Pass 1: exact match against pure JPEG choices (e.g. 'S1' on Canon EOS M200)
                 for cand in self.FAST_JPEG_CANDIDATES:
-                    for ch in choices:
-                        if cand.lower() == ch.lower() or cand.lower() in ch.lower():
+                    for ch in non_raw_choices:
+                        if cand.lower() == ch.strip().lower():
                             self._fast_jpeg_label = ch
                             found_jpg = True
                             break
                     if found_jpg:
                         break
+                # Pass 2: descriptive substring match against pure JPEG choices
+                if not found_jpg:
+                    for cand in self.FAST_JPEG_CANDIDATES:
+                        if len(cand) < 3:
+                            continue
+                        for ch in non_raw_choices:
+                            if cand.lower() in ch.lower():
+                                self._fast_jpeg_label = ch
+                                found_jpg = True
+                                break
+                        if found_jpg:
+                            break
         except Exception:
             pass
 
-    def _set_widget_sync(self, widget_name: str, candidates: tuple[str, ...]) -> bool:
+    def _set_widget_sync(self, widget_name: str, candidates: Sequence[Any]) -> bool:
         if self._gp_camera is None or gp is None:
             return False
         try:
             cfg = self._gp_get_config()
             ok, widget = gp.gp_widget_get_child_by_name(cfg, widget_name)
             if ok < gp.GP_OK:
+                return False
+
+            wtype = widget.get_type()
+            if wtype == gp.GP_WIDGET_TOGGLE:
+                for val in candidates:
+                    if isinstance(val, (int, bool)):
+                        int_val = 1 if val else 0
+                    else:
+                        s_val = str(val).strip().lower()
+                        if s_val in ("0", "off", "false", "disable"):
+                            int_val = 0
+                        elif s_val in ("1", "on", "true", "enable"):
+                            int_val = 1
+                        else:
+                            continue
+                    widget.set_value(int_val)
+                    self._gp_set_config(cfg)
+                    return True
                 return False
 
             choices: List[str] = []
@@ -269,16 +325,17 @@ class CameraController:
             if choices:
                 # 1. Exact case-insensitive match
                 for cand in candidates:
-                    cand_low = cand.strip().lower()
+                    cand_str = str(cand)
+                    cand_low = cand_str.strip().lower()
                     for ch in choices:
-                        if cand == ch or cand_low == ch.strip().lower():
+                        if cand_str == ch or cand_low == ch.strip().lower():
                             widget.set_value(ch)
                             self._gp_set_config(cfg)
                             return True
                 # 2. Safe substring match ONLY for descriptive labels (>= 3 chars, non-numeric)
                 for cand in candidates:
-                    cand_clean = cand.strip().lower()
-                    if len(cand_clean) < 3 or any(c.isdigit() for c in cand_clean) and "/" in cand_clean:
+                    cand_clean = str(cand).strip().lower()
+                    if len(cand_clean) < 3 or (any(c.isdigit() for c in cand_clean) and "/" in cand_clean):
                         continue
                     if cand_clean.replace(".", "").isdigit():
                         continue
@@ -300,10 +357,10 @@ class CameraController:
         return False
 
     def _exit_live_view_sync(self) -> None:
-        """Cleanly exit Canon EVF Live View mode so physical/Bulb shutter commands never return Busy."""
+        """Cleanly exit Canon EVF Live View mode (switches output from MOBILE2 back to TFT)."""
         if self._gp_camera is None or gp is None:
             return
-        self._set_widget_sync("viewfinder", ("0", "Off", "False"))
+        self._set_widget_sync("viewfinder", (0,))
         self._drain_events_sync(max_wait_ms=250)
 
     async def exit_live_view(self) -> None:
@@ -327,13 +384,19 @@ class CameraController:
         if exposure_s > 30.0:
             STATE.camera.shutter_speed = f"BULB ({exposure_s:g}s)"
             if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None:
-                return self._set_widget_sync("shutterspeed", ("bulb", "Bulb", "BULB"))
+                if self._set_widget_sync("shutterspeed", ("bulb", "Bulb", "BULB")):
+                    return True
+                return self._set_widget_sync("autoexposuremode", ("Bulb",))
             return True
 
         STATE.camera.shutter_speed = f"{exposure_s:g}s"
         if STATE.camera.driver_mode == "gphoto2" and self._gp_camera is not None and gp is not None:
             try:
                 cfg = self._gp_get_config()
+                ok_ae, ae_widget = gp.gp_widget_get_child_by_name(cfg, "autoexposuremode")
+                if ok_ae >= gp.GP_OK and str(ae_widget.get_value()).strip().lower() == "bulb":
+                    self._set_widget_sync("autoexposuremode", ("Manual", "M"))
+                    cfg = self._gp_get_config()
                 ok, widget = gp.gp_widget_get_child_by_name(cfg, "shutterspeed")
                 if ok >= gp.GP_OK:
                     choices = [widget.get_choice(i) for i in range(widget.count_choices())]
@@ -436,7 +499,9 @@ class CameraController:
         await self.ensure_raw_format()
 
     def _release_bulb_sync(self) -> None:
-        self._set_widget_sync("eosremoterelease", ("Release Full", "Release 2", "Release 3"))
+        # On Canon EOS M200, 'Release' closes the Bulb shutter and triggers .CR3 write;
+        # on older Canon DSLRs, 'Release Full' / 'Release 2' closes Bulb.
+        self._set_widget_sync("eosremoterelease", ("Release", "Release Full", "Release 2", "Release 3"))
         self._set_widget_sync("eosremoterelease", ("None",))
 
     async def capture_frame(
@@ -555,9 +620,11 @@ class CameraController:
                     await STATE.broadcast("EXPOSURE_TICK", self.status_dict())
                     await asyncio.sleep(0.20)
                 await capture_future
+                await loop.run_in_executor(self._executor, self._refresh_battery_sync)
                 return
 
-            # Held Bulb Exposure (> 30s) via eosremoterelease ('Press Full' / 'Press 2' — NEVER 'Immediate'!)
+            # Held Bulb Exposure (> 30s) via eosremoterelease:
+            # Canon EOS M200 uses 'Press Full MF' -> 'Release'; Canon DSLRs use 'Press Full' -> 'Release Full'.
             bulb_ok = await loop.run_in_executor(self._executor, self._set_shutter_speed_sync, exposure_s)
             if not bulb_ok:
                 raise RuntimeError(
@@ -569,7 +636,7 @@ class CameraController:
                 self._executor,
                 self._set_widget_sync,
                 "eosremoterelease",
-                ("Press Full", "Press 2"),
+                ("Press Full MF", "Press Full", "Press 2", "Press Full AF"),
             )
             if not press_ok:
                 raise RuntimeError(
@@ -577,18 +644,24 @@ class CameraController:
                 )
 
             t0 = time.monotonic()
+            last_drain = t0
             try:
                 while True:
                     if self._abort_event.is_set():
                         raise RuntimeError("Bulb exposure aborted by user")
-                    elapsed = time.monotonic() - t0
+                    now_m = time.monotonic()
+                    elapsed = now_m - t0
                     if elapsed >= exposure_s:
                         break
+                    # Periodically drain BulbExposureTime PTP events so long >120s subs never overflow camera FIFO
+                    if now_m - last_drain >= 1.0 and (exposure_s - elapsed) > 0.35:
+                        await loop.run_in_executor(self._executor, self._drain_events_sync, 50)
+                        last_drain = time.monotonic()
                     STATE.camera.exposure_elapsed_s = round(elapsed, 1)
                     STATE.camera.exposure_remaining_s = round(max(0.0, exposure_s - elapsed), 1)
                     STATE.camera.exposure_progress_pct = round(100.0 * elapsed / exposure_s, 1)
                     await STATE.broadcast("EXPOSURE_TICK", self.status_dict())
-                    await asyncio.sleep(min(0.25, max(0.02, exposure_s - elapsed)))
+                    await asyncio.sleep(min(0.25, max(0.02, exposure_s - (time.monotonic() - t0))))
             finally:
                 await loop.run_in_executor(self._executor, self._release_bulb_sync)
 
@@ -598,6 +671,7 @@ class CameraController:
                 output_path,
                 45.0,
             )
+            await loop.run_in_executor(self._executor, self._refresh_battery_sync)
             return
 
         # Simulator path (caps simulated real-time wait at 0.30s for fast responsiveness)
