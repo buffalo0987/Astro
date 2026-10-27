@@ -44,6 +44,7 @@ bash "${REPO_ROOT}/deploy/ensure_astap.sh"
 
 echo "[4/7] Deploying AstroPi application to ${INSTALL_ROOT} and creating Python venv..."
 mkdir -p "${INSTALL_ROOT}" "${DATA_DIR}/captures" "/dev/shm/astropi"
+echo "${REPO_ROOT}" > "${INSTALL_ROOT}/.git_source"
 cp -r "${REPO_ROOT}/backend" "${REPO_ROOT}/frontend" "${REPO_ROOT}/deploy" "${INSTALL_ROOT}/"
 
 python3 -m venv "${INSTALL_ROOT}/venv"

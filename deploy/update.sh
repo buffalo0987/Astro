@@ -25,6 +25,27 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INSTALL_ROOT="/opt/astropi"
+ORIGINAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+
+# If invoked directly from /opt/astropi/deploy/update.sh, locate the original git clone
+if [ ! -d "${REPO_ROOT}/.git" ]; then
+  if [ -f "${INSTALL_ROOT}/.git_source" ] && [ -d "$(cat "${INSTALL_ROOT}/.git_source")/.git" ]; then
+    REPO_ROOT="$(cat "${INSTALL_ROOT}/.git_source")"
+  elif [ -d "${PWD}/.git" ]; then
+    REPO_ROOT="${PWD}"
+  else
+    for candidate in \
+      "/home/${ORIGINAL_USER}/Astro" \
+      "/home/${ORIGINAL_USER}/Documents/Astrophotography" \
+      "${HOME}/Astro" \
+      "${HOME}/Documents/Astrophotography"; do
+      if [ -d "${candidate}/.git" ]; then
+        REPO_ROOT="${candidate}"
+        break
+      fi
+    done
+  fi
+fi
 
 echo "=============================================================================="
 echo "                   AstroPi Software Update Utility                            "
@@ -32,15 +53,30 @@ echo "==========================================================================
 
 # 1. Pull Git updates if inside a git work tree
 if [ -d "${REPO_ROOT}/.git" ]; then
-  echo "[1/4] Checking for git updates in ${REPO_ROOT}..."
-  ORIGINAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+  echo "[1/4] Pulling latest updates from GitHub in ${REPO_ROOT}..."
+  
+  # Record repository location so future updates from /opt/astropi know where git lives
+  mkdir -p "${INSTALL_ROOT}"
+  echo "${REPO_ROOT}" > "${INSTALL_ROOT}/.git_source"
+
+  # Ensure git ownership check doesn't block under sudo
+  git config --global --add safe.directory "${REPO_ROOT}" 2>/dev/null || true
+
+  # Pull updates as the original repo owner (or root fallback) with fast-forward only
+  PULL_OK=0
   if [ -n "${ORIGINAL_USER}" ] && [ "${ORIGINAL_USER}" != "root" ]; then
-    su - "${ORIGINAL_USER}" -c "cd '${REPO_ROOT}' && git pull" || echo "  -> Note: git pull failed or device is offline; proceeding with local repository code."
-  else
-    (cd "${REPO_ROOT}" && git pull) || echo "  -> Note: git pull failed or device is offline; proceeding with local repository code."
+    sudo -u "${ORIGINAL_USER}" git -C "${REPO_ROOT}" -c "safe.directory=*" pull --ff-only && PULL_OK=1 || true
+  fi
+  if [ "${PULL_OK}" -eq 0 ]; then
+    git -C "${REPO_ROOT}" -c "safe.directory=*" pull --ff-only && PULL_OK=1 || true
+  fi
+
+  if [ "${PULL_OK}" -eq 0 ]; then
+    echo "  -> [WARNING] 'git pull' could not complete automatically (e.g., offline or uncommitted changes)."
+    echo "               Proceeding with local repository code."
   fi
 else
-  echo "[1/4] No .git directory found; syncing from current local files..."
+  echo "[1/4] No .git directory found at ${REPO_ROOT}; syncing from current local files..."
 fi
 
 COMMIT_HASH="$(cd "${REPO_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo 'local')"
