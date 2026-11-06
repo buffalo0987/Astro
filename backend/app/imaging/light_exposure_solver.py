@@ -127,48 +127,60 @@ def estimate_sky_and_star_flux(
     probe_exposure_s: float,
     probe_iso: str,
     p9985_adu: Optional[float] = None,
+    linear_stats: Optional[Dict[str, float]] = None,
 ) -> Tuple[float, float, str]:
     """Estimate ISO-invariant sky background rate (e-/px/s) and bright field-star rate (e-/px/s)."""
     probe_spec = get_eos_m200_sensor_spec(probe_iso)
     probe_fwc = probe_spec["full_well_e"]
     t_s = max(0.05, float(probe_exposure_s))
 
-    bg_med = float(hist.get("median_adu", 0.0))
-    max_ch_med = max(
-        bg_med,
-        float(hist.get("r_median_adu", bg_med)),
-        float(hist.get("g_median_adu", bg_med)),
-        float(hist.get("b_median_adu", bg_med)),
-    )
-    # Blend luma median with brightest RGB channel median to protect against strong red/amber LP
-    sky_ref_adu = 0.65 * bg_med + 0.35 * max_ch_med
-    jpeg_floor_lin = 0.0012
-    lin_sky = max(0.00012, srgb_u8_to_linear(sky_ref_adu) - jpeg_floor_lin)
-    sky_rate_e_s = max(0.10, (lin_sky * probe_fwc) / t_s)
-
-    stars = star_metrics.get("stars") or []
-    if len(stars) >= 3:
-        peaks = sorted(float(s.get("peak_adu", bg_med)) for s in stars)
-        p75_star = peaks[min(len(peaks) - 1, int(0.75 * len(peaks)))]
-    elif len(stars) > 0:
-        p75_star = max(float(s.get("peak_adu", bg_med)) for s in stars)
+    if linear_stats is not None:
+        med_lin = float(linear_stats.get("linear_median_norm", 0.0))
+        max_ch_lin = float(linear_stats.get("linear_max_ch_median_norm", med_lin))
+        p999_lin = float(linear_stats.get("linear_p999_norm", med_lin))
+        lin_sky = max(0.00012, 0.65 * med_lin + 0.35 * max_ch_lin)
+        sky_rate_e_s = max(0.10, (lin_sky * probe_fwc) / t_s)
+        lin_star_above_bg = max(0.0, p999_lin - med_lin)
+        if p999_lin >= 0.96:
+            lin_star_above_bg = max(lin_star_above_bg, 1.35)
+        star_rate_e_s = (lin_star_above_bg * probe_fwc) / t_s
     else:
-        p75_star = float(hist.get("p99_adu", bg_med))
+        bg_med = float(hist.get("median_adu", 0.0))
+        max_ch_med = max(
+            bg_med,
+            float(hist.get("r_median_adu", bg_med)),
+            float(hist.get("g_median_adu", bg_med)),
+            float(hist.get("b_median_adu", bg_med)),
+        )
+        # Blend luma median with brightest RGB channel median to protect against strong red/amber LP
+        sky_ref_adu = 0.65 * bg_med + 0.35 * max_ch_med
+        jpeg_floor_lin = 0.0012
+        lin_sky = max(0.00012, srgb_u8_to_linear(sky_ref_adu) - jpeg_floor_lin)
+        sky_rate_e_s = max(0.10, (lin_sky * probe_fwc) / t_s)
 
-    max_ch_p99 = float(hist.get("max_channel_p99_adu", p75_star))
-    if p9985_adu is not None:
-        star_ref_adu = max(p75_star, min(253.0, float(p9985_adu) * 0.94))
-    elif max_ch_p99 >= 245.0:
-        # >1% of pixels near saturation indicates an intense star cluster / bright core
-        star_ref_adu = max(p75_star, max_ch_p99)
-    else:
-        star_ref_adu = p75_star
+        stars = star_metrics.get("stars") or []
+        if len(stars) >= 3:
+            peaks = sorted(float(s.get("peak_adu", bg_med)) for s in stars)
+            p75_star = peaks[min(len(peaks) - 1, int(0.75 * len(peaks)))]
+        elif len(stars) > 0:
+            p75_star = max(float(s.get("peak_adu", bg_med)) for s in stars)
+        else:
+            p75_star = float(hist.get("p99_adu", bg_med))
 
-    lin_star_above_bg = max(0.0, srgb_u8_to_linear(star_ref_adu) - srgb_u8_to_linear(bg_med))
-    if star_ref_adu >= 248.0:
-        # Bright field stars are already clipping in the short probe shot
-        lin_star_above_bg = max(lin_star_above_bg, 1.35)
-    star_rate_e_s = (lin_star_above_bg * probe_fwc) / t_s
+        max_ch_p99 = float(hist.get("max_channel_p99_adu", p75_star))
+        if p9985_adu is not None:
+            star_ref_adu = max(p75_star, min(253.0, float(p9985_adu) * 0.94))
+        elif max_ch_p99 >= 245.0:
+            # >1% of pixels near saturation indicates an intense star cluster / bright core
+            star_ref_adu = max(p75_star, max_ch_p99)
+        else:
+            star_ref_adu = p75_star
+
+        lin_star_above_bg = max(0.0, srgb_u8_to_linear(star_ref_adu) - srgb_u8_to_linear(bg_med))
+        if star_ref_adu >= 248.0:
+            # Bright field stars are already clipping in the short probe shot
+            lin_star_above_bg = max(lin_star_above_bg, 1.35)
+        star_rate_e_s = (lin_star_above_bg * probe_fwc) / t_s
 
     # Approximate Bortle / filter sky condition description from measured sky_rate_e_s at f/4.5, 3.72um
     if sky_rate_e_s < 0.75:
@@ -194,6 +206,7 @@ def solve_optimal_light_exposure(
     pa_calibrated: bool = False,
     pixel_scale_arcsec: Optional[float] = None,
     p9985_adu: Optional[float] = None,
+    linear_stats: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Compute optimal Light (exposure_s, iso) and full diagnostic telemetry."""
     tracking = compute_sa2i_tracking_ceiling(
@@ -209,6 +222,7 @@ def solve_optimal_light_exposure(
         probe_exposure_s=probe_exposure_s,
         probe_iso=probe_iso,
         p9985_adu=p9985_adu,
+        linear_stats=linear_stats,
     )
 
     candidates: Dict[str, Dict[str, Any]] = {}

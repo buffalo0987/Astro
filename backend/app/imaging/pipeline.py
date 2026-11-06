@@ -1,13 +1,13 @@
-"""Shared Non-Blocking Preview, MTF Stretch, Histogram & Star HFR Pipeline for Raspberry Pi 4.
+"""Shared Non-Blocking Preview, MTF Stretch, Histogram & Star Photometry Pipeline for Pi 4.
 
-Offloads all NumPy / SciPy / Pillow image processing to worker threads via asyncio.to_thread()
-so the main FastAPI/WebSocket event loop stays sub-millisecond responsive during exposures.
+Offloads all NumPy / C-extension image processing (`simplejpeg`, `sep`, `rawpy`, `Pillow`)
+to worker threads via `asyncio.to_thread()` so the main FastAPI/WebSocket event loop stays
+sub-millisecond responsive during exposures.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import shutil
 import time
 from pathlib import Path
@@ -18,7 +18,7 @@ from PIL import Image
 
 from ..config import CONFIG
 from ..state import STATE
-from .cr3_parser import decode_cr3_preview_array
+from .cr3_parser import decode_cr3_preview_array, decode_jpeg_fast, encode_jpeg_fast
 from .focus_metrics import compute_star_hfr_metrics
 from .stretch import auto_stretch_rgb, compute_histogram_256
 
@@ -40,15 +40,11 @@ def _process_preview_sync(
     meta: Optional[Dict[str, Any]] = None,
     cache_source_for_retoggle: bool = True,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Decode, optionally MTF-stretch, compute histogram + HFR, and write /dev/shm/astropi/latest_preview.jpg."""
+    """Decode, optionally MTF-stretch, compute histogram + HFR/Eccentricity, and write preview."""
     do_stretch = STATE.auto_stretch_enabled if enable_stretch is None else bool(enable_stretch)
 
     if jpeg_bytes is not None:
-        with Image.open(io.BytesIO(jpeg_bytes)) as img:
-            rgb_img = img.convert("RGB")
-            if max(rgb_img.size) > max_dim:
-                rgb_img.thumbnail((max_dim, max_dim))
-            arr_rgb = np.asarray(rgb_img, dtype=np.uint8)
+        arr_rgb = decode_jpeg_fast(jpeg_bytes, max_dim=max_dim, roi_norm=roi_norm)
         decoded_from = source_label or "Live Viewfinder"
     elif source_path is not None:
         arr_rgb, raw_src = decode_cr3_preview_array(
@@ -65,12 +61,13 @@ def _process_preview_sync(
     # (Skyfog 15-35% & Flat 35-55% ADU guides) and for instant Stretch ON/OFF retoggling!
     u8_base = (
         arr_rgb
-        if arr_rgb.dtype == np.uint8
+        if arr_rgb.dtype == "uint8"
         else auto_stretch_rgb(arr_rgb, enable_stretch=False)
     )
     if cache_source_for_retoggle and jpeg_bytes is None:
         try:
-            Image.fromarray(u8_base).save(LAST_UNSTRETCHED_PATH, format="JPEG", quality=92)
+            LAST_UNSTRETCHED_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LAST_UNSTRETCHED_PATH.write_bytes(encode_jpeg_fast(u8_base, quality=92))
         except Exception:
             pass
 
@@ -84,6 +81,8 @@ def _process_preview_sync(
             "star_count": 0,
             "hfr_median": 0.0,
             "fwhm_arcsec": 0.0,
+            "eccentricity_median": 0.0,
+            "roundness_label": "No Stars",
             "bg_median_adu": hist["median_adu"],
             "stars": [],
         }
@@ -91,20 +90,22 @@ def _process_preview_sync(
     preview_path = CONFIG.shm_dir / "latest_preview.jpg"
     preview_tmp = CONFIG.shm_dir / "latest_preview.tmp.jpg"
     preview_path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(stretched).save(preview_tmp, format="JPEG", quality=jpeg_quality)
+    preview_tmp.write_bytes(encode_jpeg_fast(stretched, quality=jpeg_quality))
     shutil.move(str(preview_tmp), str(preview_path))
 
     if thumbnail_path is not None:
         thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
         thumb_img = Image.fromarray(stretched)
         thumb_img.thumbnail((480, 320))
-        thumb_img.save(thumbnail_path, format="JPEG", quality=80)
+        thumbnail_path.write_bytes(encode_jpeg_fast(np.asarray(thumb_img, dtype=np.uint8), quality=80))
 
     ts_ms = int(time.time() * 1000)
     merged_meta = dict(meta or {})
     if compute_hfr:
         merged_meta.setdefault("hfr_median", metrics["hfr_median"])
         merged_meta.setdefault("fwhm_arcsec", metrics["fwhm_arcsec"])
+        merged_meta.setdefault("eccentricity_median", metrics.get("eccentricity_median", 0.0))
+        merged_meta.setdefault("roundness_label", metrics.get("roundness_label", "Round"))
         merged_meta.setdefault("star_count", metrics["star_count"])
 
     preview_payload: Dict[str, Any] = {

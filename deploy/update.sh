@@ -88,9 +88,11 @@ mkdir -p "${INSTALL_ROOT}"
 
 if command -v rsync >/dev/null 2>&1; then
   rsync -a --delete --exclude '__pycache__' --exclude '*.pyc' "${REPO_ROOT}/backend/" "${INSTALL_ROOT}/backend/"
-  rsync -a --delete "${REPO_ROOT}/frontend/dist/" "${INSTALL_ROOT}/frontend/dist/"
+  rsync -a --delete "${REPO_ROOT}/frontend/" "${INSTALL_ROOT}/frontend/"
   rsync -a --delete "${REPO_ROOT}/deploy/" "${INSTALL_ROOT}/deploy/"
 else
+  rm -rf "${INSTALL_ROOT}/frontend"
+  mkdir -p "${INSTALL_ROOT}/frontend"
   cp -r "${REPO_ROOT}/backend" "${INSTALL_ROOT}/"
   cp -r "${REPO_ROOT}/frontend/dist" "${INSTALL_ROOT}/frontend/"
   cp -r "${REPO_ROOT}/deploy" "${INSTALL_ROOT}/"
@@ -102,12 +104,12 @@ chmod +x "${INSTALL_ROOT}/deploy/"*.sh 2>/dev/null || true
 # 3. Update Python dependencies & verify ASTAP 180mm star catalog
 echo "[3/5] Checking Python dependencies..."
 if [ -f "${INSTALL_ROOT}/venv/bin/pip" ]; then
-  "${INSTALL_ROOT}/venv/bin/pip" install -q -r "${INSTALL_ROOT}/backend/requirements.txt"
+  "${INSTALL_ROOT}/venv/bin/pip" install -q --prefer-binary -r "${INSTALL_ROOT}/backend/requirements.txt"
 else
   echo "  -> Virtualenv not found. Creating at ${INSTALL_ROOT}/venv..."
   python3 -m venv "${INSTALL_ROOT}/venv"
   "${INSTALL_ROOT}/venv/bin/pip" install -q --upgrade pip
-  "${INSTALL_ROOT}/venv/bin/pip" install -q -r "${INSTALL_ROOT}/backend/requirements.txt"
+  "${INSTALL_ROOT}/venv/bin/pip" install -q --prefer-binary -r "${INSTALL_ROOT}/backend/requirements.txt"
 fi
 
 echo "[4/5] Verifying ASTAP plate-solver & 180mm star catalog..."

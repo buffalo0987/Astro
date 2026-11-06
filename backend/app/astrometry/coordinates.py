@@ -40,6 +40,11 @@ def unix_to_jd(utc_timestamp: float) -> float:
     return (utc_timestamp / 86400.0) + 2440587.5
 
 
+def unix_to_jd_two_part(utc_timestamp: float) -> Tuple[float, float]:
+    """Return two-part Julian Date (jd1, jd2) preserving sub-microsecond SOFA precision."""
+    return 2440587.5, utc_timestamp / 86400.0
+
+
 def bennett_refraction_deg(
     true_alt_deg: float,
     pressure_hpa: float = 1010.0,
@@ -185,15 +190,16 @@ def j2000_to_topocentric_altaz(
 
     if HAS_ERFA and _erfa is not None:
         pressure = observer.pressure_hpa if observer.refraction_enabled else 0.0
-        az_r, zen_r, _, _, _ = _erfa.atco13(
+        utc1, utc2 = unix_to_jd_two_part(utc_timestamp)
+        az_r, zen_r, _, _, _, _ = _erfa.atco13(
             ra_rad,
             dec_rad,
             0.0,
             0.0,
             0.0,
             0.0,
-            jd_utc,
-            0.0,
+            utc1,
+            utc2,
             0.0,
             math.radians(observer.longitude_deg),
             math.radians(observer.latitude_deg),

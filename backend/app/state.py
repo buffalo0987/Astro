@@ -13,8 +13,12 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import psutil
 
 from .astrometry.astap_runner import check_astap_readiness
+from .astrometry.coordinates import HAS_ERFA
 from .config import CONFIG
 from .db import DB
+from .imaging.cr3_parser import HAS_RAWPY, HAS_SIMPLEJPEG
+from .imaging.focus_metrics import HAS_SEP
+from .web_compat import HAS_HTTPTOOLS, HAS_NATIVE_FASTAPI, HAS_ORJSON, HAS_UVLOOP, json_dumps
 
 
 @dataclass
@@ -71,6 +75,18 @@ class SystemTelemetry:
     smb_mac_url: str = "smb://astro.local/captures"
     astap_ready: bool = False
     astap_status: str = "Checking..."
+    runtime_stack: Dict[str, bool] = field(
+        default_factory=lambda: {
+            "fastapi": HAS_NATIVE_FASTAPI,
+            "orjson": HAS_ORJSON,
+            "uvloop": HAS_UVLOOP,
+            "httptools": HAS_HTTPTOOLS,
+            "pyerfa": HAS_ERFA,
+            "rawpy": HAS_RAWPY,
+            "simplejpeg": HAS_SIMPLEJPEG,
+            "sep": HAS_SEP,
+        }
+    )
 
 
 class StateManager:
@@ -128,10 +144,12 @@ class StateManager:
             "loop_running": False,
             "hfr_median": 0.0,
             "fwhm_arcsec": 0.0,
+            "eccentricity_median": 0.0,
+            "roundness_label": "No Stars",
             "star_count": 0,
             "min_hfr_achieved": None,
             "roi": None,  # {"x": float, "y": float, "size": int}
-            "history": [],  # [{"timestamp": float, "hfr": float, "fwhm": float, "stars": int}]
+            "history": [],  # [{"timestamp": float, "hfr": float, "fwhm": float, "eccentricity": float, "stars": int}]
             "audio_cues_enabled": True,
         }
         self.latest_preview: Dict[str, Any] = {
@@ -160,6 +178,8 @@ class StateManager:
             "interlock_message": None,
             "last_saved_file": None,
             "last_frame_hfr": None,
+            "last_frame_eccentricity": None,
+            "last_frame_roundness": None,
         }
         self._ws_senders: Set[Callable[[str], Any]] = set()
         self._load_persisted_observer()
@@ -246,7 +266,7 @@ class StateManager:
     async def broadcast(self, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
         if not self._ws_senders:
             return
-        message = json.dumps(
+        message = json_dumps(
             {
                 "type": event_type,
                 "timestamp": time.time(),

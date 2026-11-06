@@ -420,6 +420,7 @@ class SequenceEngine:
                         file_size_bytes=fsize,
                         hfr_median=float(metrics["hfr_median"]),
                         fwhm_arcsec=float(metrics["fwhm_arcsec"]),
+                        eccentricity=float(metrics.get("eccentricity_median", 0.0)),
                         star_count=int(metrics["star_count"]),
                         bg_median_adu=float(metrics["bg_median_adu"]),
                         thumbnail_path=thumb_rel,
@@ -442,6 +443,8 @@ class SequenceEngine:
                             "overall_total": updated_plan["total_frames"],
                             "last_saved_file": filename,
                             "last_frame_hfr": metrics["hfr_median"],
+                            "last_frame_eccentricity": metrics.get("eccentricity_median", 0.0),
+                            "last_frame_roundness": metrics.get("roundness_label", "Round"),
                         }
                     )
                     await STATE.broadcast("FRAME_SAVED", STATE.snapshot())

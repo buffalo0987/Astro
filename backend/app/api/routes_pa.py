@@ -13,7 +13,8 @@ from ..hardware.camera_actor import CAMERA
 from ..hardware.simulated_camera import SIM_RIG
 from ..imaging.pipeline import process_and_publish_preview
 from ..state import STATE
-from ..web_compat import APIRouter, HTTPException
+from ..web_compat import APIRouter, Body, HTTPException
+from .schemas import ensure_body_dict
 
 router = APIRouter(prefix="/api/pa", tags=["polar_alignment"])
 
@@ -38,9 +39,9 @@ async def get_pa_state() -> Dict[str, Any]:
 
 
 @router.post("/start")
-async def start_pa_workflow(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def start_pa_workflow(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Enter Polar Alignment mode, switch camera to Small Fine JPEG, and reset solver."""
-    body = payload or {}
+    body = ensure_body_dict(payload)
     await stop_pa_live_loop({"restore_raw": False})
 
     mode_points = int(body.get("mode_points", 3))
@@ -68,9 +69,9 @@ async def start_pa_workflow(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 @router.post("/capture-point")
-async def capture_pa_calibration_point(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def capture_pa_calibration_point(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Capture a fast JPEG in /dev/shm, plate-solve via ASTAP, and add a calibration point."""
-    body = payload or {}
+    body = ensure_body_dict(payload)
     exposure_s = float(body.get("exposure_s", 2.0))
     iso = str(body.get("iso", "1600"))
     simulate_ra_step_deg = float(body.get("simulate_ra_step_deg", 0.0))
@@ -138,9 +139,9 @@ async def capture_pa_calibration_point(payload: Dict[str, Any] = None) -> Dict[s
 
 
 @router.post("/live-step")
-async def execute_pa_live_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def execute_pa_live_step(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Execute one fast-solve iteration (~2.5s cycle) of the Live Wedge Adjustment phase."""
-    body = payload or {}
+    body = ensure_body_dict(payload)
     exposure_s = float(body.get("exposure_s", 2.0))
     iso = str(body.get("iso", "1600"))
 
@@ -272,9 +273,9 @@ async def _continuous_pa_worker(exposure_s: float, iso: str) -> None:
 
 
 @router.post("/live-loop/start")
-async def start_pa_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def start_pa_live_loop(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     global _pa_loop_task
-    body = payload or {}
+    body = ensure_body_dict(payload)
     exposure_s = float(body.get("exposure_s", 2.0))
     iso = str(body.get("iso", "1600"))
 
@@ -290,9 +291,9 @@ async def start_pa_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 @router.post("/live-loop/stop")
-async def stop_pa_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def stop_pa_live_loop(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     global _pa_loop_task
-    body = payload or {}
+    body = ensure_body_dict(payload)
     restore_raw = bool(body.get("restore_raw", True))
     _pa_loop_stop.set()
     if _pa_loop_task is not None and not _pa_loop_task.done():
@@ -313,9 +314,9 @@ async def stop_pa_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 @router.post("/sim-control")
-async def simulator_pa_control(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def simulator_pa_control(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Adjust simulated Star Adventurer 2i wedge knobs or RA clutch angle during testing."""
-    body = payload or {}
+    body = ensure_body_dict(payload)
     if "rotate_ra_deg" in body:
         SIM_RIG.rotate_ra_clutch(float(body["rotate_ra_deg"]))
     if "d_alt_arcmin" in body or "d_az_arcmin" in body:

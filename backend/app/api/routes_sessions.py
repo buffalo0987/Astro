@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ..db import DB
 from ..imaging.zip_streamer import stream_zip_stored_async
 from ..sequencer.storage import STORAGE
-from ..web_compat import APIRouter, FileResponse, HTTPException, Response, StreamingResponse
+from ..web_compat import APIRouter, Body, FileResponse, HTTPException, Response, StreamingResponse
+from .schemas import coerce_float, ensure_body_dict
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions_offload"])
 
@@ -26,9 +27,9 @@ async def list_sessions() -> Dict[str, Any]:
 async def cull_or_restore_frame(
     session_id: str,
     frame_id: str,
-    payload: Dict[str, Any] = None,
+    payload: Optional[Dict[str, Any]] = Body(default=None),
 ) -> Dict[str, Any]:
-    body = payload or {}
+    body = ensure_body_dict(payload)
     status = str(body.get("status", "rejected"))
     reason = str(body.get("reject_reason", "Manual user cull"))
     try:
@@ -39,11 +40,25 @@ async def cull_or_restore_frame(
 
 
 @router.post("/{session_id}/auto-cull")
-async def auto_cull_session(session_id: str, payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
-    sigma = float(body.get("hfr_sigma_limit", 2.0))
+async def auto_cull_session(
+    session_id: str,
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
+    sigma = coerce_float(body, "hfr_sigma_limit", 2.0, min_val=0.5, max_val=10.0)
     res = STORAGE.auto_cull_session_outliers(session_id, hfr_sigma_Limit=sigma)
     return res
+
+
+@router.post("/{session_id}/cull-trailed")
+async def cull_trailed_session_frames(
+    session_id: str,
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> Dict[str, Any]:
+    """One-tap manual action to move Light frames exceeding max_eccentricity (default 0.65) to rejected/."""
+    body = ensure_body_dict(payload)
+    max_ecc = coerce_float(body, "max_eccentricity", 0.65, min_val=0.35, max_val=0.98)
+    return STORAGE.cull_trailed_frames(session_id, max_eccentricity=max_ecc)
 
 
 @router.get("/{session_id}/frames/{frame_id}/thumbnail.jpg")
@@ -137,8 +152,11 @@ async def download_session_streaming_zip(
 
 
 @router.post("/{session_id}/mark-offloaded")
-async def mark_session_offloaded(session_id: str, payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def mark_session_offloaded(
+    session_id: str,
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     offloaded = bool(body.get("offloaded", True))
     try:
         return STORAGE.mark_session_offloaded(session_id, offloaded=offloaded)

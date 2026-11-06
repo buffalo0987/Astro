@@ -304,6 +304,16 @@ body {
   text-align: center;
 }
 
+.kpi-grid.kpi-grid-4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+@media (max-width: 640px) {
+  .kpi-grid.kpi-grid-4 {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
 @media (max-width: 480px) {
   .kpi-grid-2col-sm {
     grid-template-columns: 1fr;

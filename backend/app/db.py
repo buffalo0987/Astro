@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS captured_frames (
     file_size_bytes INTEGER NOT NULL DEFAULT 0,
     hfr_median REAL,
     fwhm_Arcsec REAL,
+    eccentricity REAL DEFAULT 0.0,
     star_count INTEGER DEFAULT 0,
     bg_median_adu REAL DEFAULT 0.0,
     solved_ra_hours REAL,
@@ -145,6 +146,12 @@ class Database:
                     conn.execute("ALTER TABLE capture_sessions ADD COLUMN target_ra_hours REAL")
                 if "target_dec_deg" not in cols:
                     conn.execute("ALTER TABLE capture_sessions ADD COLUMN target_dec_deg REAL")
+                frame_cols = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(captured_frames)").fetchall()
+                }
+                if "eccentricity" not in frame_cols:
+                    conn.execute("ALTER TABLE captured_frames ADD COLUMN eccentricity REAL DEFAULT 0.0")
                 conn.commit()
                 self._seed_defaults(conn)
             finally:

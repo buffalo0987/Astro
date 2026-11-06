@@ -28,7 +28,7 @@ echo "[1/7] Installing system packages (libgphoto2, Samba, Avahi, exFAT, Network
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   python3 python3-venv python3-pip python3-dev build-essential pkg-config \
-  gphoto2 libgphoto2-dev libusb-1.0-0-dev \
+  gphoto2 libgphoto2-dev libusb-1.0-0-dev libjpeg-dev \
   samba avahi-daemon avahi-utils \
   exfatprogs ntfs-3g udisks2 \
   network-manager curl ca-certificates unzip git rsync
@@ -49,7 +49,7 @@ cp -r "${REPO_ROOT}/backend" "${REPO_ROOT}/frontend" "${REPO_ROOT}/deploy" "${IN
 
 python3 -m venv "${INSTALL_ROOT}/venv"
 "${INSTALL_ROOT}/venv/bin/pip" install --upgrade pip
-"${INSTALL_ROOT}/venv/bin/pip" install -r "${INSTALL_ROOT}/backend/requirements.txt"
+"${INSTALL_ROOT}/venv/bin/pip" install --prefer-binary -r "${INSTALL_ROOT}/backend/requirements.txt"
 
 echo "[5/7] Configuring Zero-Config Samba (SMB3) share and Avahi mDNS (astro.local)..."
 hostnamectl set-hostname astro || true

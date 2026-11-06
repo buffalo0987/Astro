@@ -15,10 +15,16 @@ from ..hardware.camera_actor import (
     parse_canon_shutter_choice,
 )
 from ..hardware.simulated_camera import SIM_RIG
-from ..imaging.light_exposure_solver import solve_optimal_light_exposure
+from ..imaging.cr3_parser import HAS_RAWPY, measure_cr3_linear_stats
+from ..imaging.light_exposure_solver import (
+    linear_to_srgb_pct,
+    solve_optimal_light_exposure,
+    srgb_u8_to_linear,
+)
 from ..imaging.pipeline import LAST_UNSTRETCHED_PATH, process_and_publish_preview
 from ..state import STATE
-from ..web_compat import APIRouter, FileResponse, HTTPException, Response
+from ..web_compat import APIRouter, Body, FileResponse, HTTPException, Response
+from .schemas import coerce_float, ensure_body_dict
 
 router = APIRouter(prefix="/api/camera", tags=["camera"])
 
@@ -90,7 +96,7 @@ CAMERA.register_pre_capture_hook(stop_live_loop_quietly)
 
 
 @router.post("/live-loop/start")
-async def start_live_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def start_live_loop(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     global _preview_loop_task
     if STATE.camera.exposing or (STATE.active_mode == "SEQUENCE" and STATE.sequence_state.get("status") == "RUNNING"):
         raise HTTPException(
@@ -133,8 +139,8 @@ async def reset_camera_usb() -> Dict[str, Any]:
 
 
 @router.post("/format")
-async def set_camera_format(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def set_camera_format(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     fast_jpeg = bool(body.get("fast_jpeg", False))
     if fast_jpeg:
         fmt = await CAMERA.set_fast_jpeg_mode()
@@ -150,22 +156,23 @@ async def abort_exposure() -> Dict[str, Any]:
 
 
 @router.post("/config")
-async def set_camera_config(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def set_camera_config(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Set ISO, shutter speed, or capture settings directly on the physical camera."""
-    body = payload or {}
+    body = ensure_body_dict(payload)
     iso = body.get("iso")
     exposure_s = body.get("exposure_s")
     if iso is not None:
         await CAMERA.set_iso(str(iso))
     if exposure_s is not None:
-        await CAMERA.set_shutter_speed(float(exposure_s))
+        exp_val = coerce_float(body, "exposure_s", 2.0, min_val=0.0001)
+        await CAMERA.set_shutter_speed(exp_val)
     return CAMERA.status_dict()
 
 
 @router.post("/preview-stretch")
-async def toggle_preview_stretch(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def toggle_preview_stretch(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Toggle PixInsight MTF Auto-Stretch ON/OFF and re-render current preview without shooting."""
-    body = payload or {}
+    body = ensure_body_dict(payload)
     if "auto_stretch" in body:
         STATE.auto_stretch_enabled = bool(body["auto_stretch"])
     elif "enabled" in body:
@@ -197,10 +204,10 @@ async def toggle_preview_stretch(payload: Dict[str, Any] = None) -> Dict[str, An
 
 
 @router.post("/capture")
-async def capture_manual_preview(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def capture_manual_preview(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Capture a single test frame, run MTF auto-stretch + HFR, and restore RAW (.CR3) if requested."""
-    body = payload or {}
-    exposure_s = float(body.get("exposure_s", 2.0))
+    body = ensure_body_dict(payload)
+    exposure_s = coerce_float(body, "exposure_s", 2.0, min_val=0.0001)
     iso = str(body.get("iso", "800"))
     frame_type = str(body.get("frame_type", "Light"))
     fast_jpeg = bool(body.get("fast_jpeg", True))
@@ -245,13 +252,13 @@ async def capture_manual_preview(payload: Dict[str, Any] = None) -> Dict[str, An
 
 
 @router.post("/auto-flat")
-async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def auto_calibrate_flat(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Automatically solve optimal Flat shutter speed & ISO (35-55% unstretched ADU, unclipped).
 
-    Starts at clean ISO 100 by default, uses inverse-gamma (2.2) proportional jumps snapped to
-    physical Canon EOS M200 1/3-stop shutter choices, steps ISO up only when dimmer panels or
-    dual-band filters would exceed max_exposure_s, warns on PWM screen flicker (<1/250s), and
-    guarantees restoration to RAW (.CR3).
+    Starts at clean ISO 100 by default, uses 14-bit linear RAW statistics via rawpy (when shooting
+    .CR3 on Pi) or inverse-gamma (2.2) proportional jumps snapped to physical Canon EOS M200
+    1/3-stop shutter choices, steps ISO up only when dimmer panels or dual-band filters would
+    exceed max_exposure_s, warns on PWM screen flicker (<1/250s), and restores RAW (.CR3).
     """
     if STATE.camera.exposing or (
         STATE.active_mode == "SEQUENCE" and STATE.sequence_state.get("status") == "RUNNING"
@@ -261,7 +268,7 @@ async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
             detail="Cannot run Auto-Flat calibration while an exposure or imaging sequence is actively running.",
         )
 
-    body = payload or {}
+    body = ensure_body_dict(payload)
     iso_ladder = ("100", "200", "400", "800", "1600")
     lock_iso = bool(body.get("lock_iso", False))
     preferred_iso = str(body.get("preferred_iso", "100")).strip()
@@ -319,7 +326,13 @@ async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
     if has_sim_override:
         SIM_RIG.flat_panel_ev_flux = max(0.0, float(body["sim_flat_flux"]))
 
-    out_file = CONFIG.shm_dir / "auto_flat_probe.jpg"
+    use_raw_probe = bool(
+        body.get("use_raw_linear", False)
+        and HAS_RAWPY
+        and STATE.camera.driver_mode != "simulator"
+    )
+    out_file = CONFIG.shm_dir / ("auto_flat_probe.CR3" if use_raw_probe else "auto_flat_probe.jpg")
+    target_lin_norm = srgb_u8_to_linear(target_adu)
 
     try:
         for step_num in range(1, max_iterations + 1):
@@ -345,7 +358,7 @@ async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
                 output_path=out_file,
                 exposure_s=snapped_exp_s,
                 iso=cur_iso,
-                fast_jpeg=True,
+                fast_jpeg=not use_raw_probe,
                 frame_type="Flat",
                 mode="FLAT",
                 max_retries=1,
@@ -356,7 +369,7 @@ async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
                 enable_stretch=False,
                 compute_hfr=False,
                 jpeg_quality=85,
-                source_label="Auto-Flat Probe (S1)",
+                source_label="Auto-Flat Probe (14-bit CR3)" if use_raw_probe else "Auto-Flat Probe (S1)",
                 max_overlay_stars=0,
                 meta={
                     "exposure_s": snapped_exp_s,
@@ -368,9 +381,17 @@ async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
                 broadcast=True,
             )
             hist = preview.get("histogram") or {}
-            med_adu = float(hist.get("median_adu", 0.0))
-            max_ch_p99 = float(hist.get("max_channel_p99_adu", hist.get("p99_adu", 0.0)))
-            adu_pct = round((med_adu / 255.0) * 100.0, 1)
+            lin_stats = await asyncio.to_thread(measure_cr3_linear_stats, out_file) if use_raw_probe else None
+            if lin_stats is not None:
+                cur_lin = float(lin_stats["linear_median_norm"])
+                adu_pct = float(linear_to_srgb_pct(cur_lin))
+                med_adu = round((adu_pct / 100.0) * 255.0, 1)
+                max_ch_p99 = round(float(linear_to_srgb_pct(lin_stats["linear_max_ch_p99_norm"])) * 2.55, 1)
+            else:
+                med_adu = float(hist.get("median_adu", 0.0))
+                max_ch_p99 = float(hist.get("max_channel_p99_adu", hist.get("p99_adu", 0.0)))
+                adu_pct = round((med_adu / 255.0) * 100.0, 1)
+                cur_lin = 0.0
 
             entry = {
                 "step": step_num,
@@ -390,8 +411,13 @@ async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
                 best_entry = entry
                 break
 
-            # Proportional inverse-gamma (2.2) solver with saturation/pedestal guards
-            if med_adu >= 240.0:
+            # Direct 14-bit linear ratio when rawpy stats are active, else inverse-gamma (2.2) sRGB solver
+            if lin_stats is not None and cur_lin > 0.001:
+                if lin_stats["linear_max_ch_p99_norm"] >= 0.90:
+                    ratio = 0.25
+                else:
+                    ratio = max(0.08, min(16.0, target_lin_norm / cur_lin))
+            elif med_adu >= 240.0:
                 ratio = 0.125
             elif max_ch_p99 >= 240.0 or med_adu >= 225.0:
                 ratio = 0.28
@@ -505,7 +531,7 @@ async def auto_calibrate_flat(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 @router.post("/auto-light")
-async def auto_expose_light(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def auto_expose_light(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Automatically solve optimal Light sub-exposure & ISO from plate-solved sky & SA2i tracking.
 
     Captures a fast 4s @ ISO 1600 sky probe, plate-solves via ASTAP to determine exact live
@@ -521,7 +547,7 @@ async def auto_expose_light(payload: Dict[str, Any] = None) -> Dict[str, Any]:
             detail="Cannot run Auto-Light solver while an exposure or imaging sequence is actively running.",
         )
 
-    body = payload or {}
+    body = ensure_body_dict(payload)
     probe_exp_s = max(0.5, min(15.0, float(body.get("probe_exposure_s", 4.0))))
     probe_iso = str(body.get("probe_iso", "1600")).strip()
 
@@ -621,6 +647,7 @@ async def auto_expose_light(payload: Dict[str, Any] = None) -> Dict[str, Any]:
         else:
             pa_err_arcmin = 4.0
 
+        lin_stats = await asyncio.to_thread(measure_cr3_linear_stats, probe_file)
         solution = solve_optimal_light_exposure(
             hist=hist,
             star_metrics=star_metrics,
@@ -630,6 +657,7 @@ async def auto_expose_light(payload: Dict[str, Any] = None) -> Dict[str, Any]:
             declination_source=declination_source,
             pa_error_arcmin=pa_err_arcmin,
             pa_calibrated=pa_calibrated,
+            linear_stats=lin_stats,
         )
         solution["plate_solved"] = bool(solve.solved)
         solution["solved_ra_hours"] = round(float(solve.ra_hours), 4) if solve.solved else None

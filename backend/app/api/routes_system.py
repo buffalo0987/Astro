@@ -6,13 +6,14 @@ import datetime as dt
 import ipaddress
 import time
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from ..config import CONFIG
 from ..db import DB
 from ..sequencer.storage import STORAGE
 from ..state import STATE
-from ..web_compat import APIRouter, HTTPException, Response
+from ..web_compat import APIRouter, Body, HTTPException, Response
+from .schemas import ensure_body_dict
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -135,8 +136,8 @@ async def list_site_presets() -> Dict[str, Any]:
 
 
 @router.post("/presets")
-async def create_site_preset(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def create_site_preset(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     preset = DB.save_site_preset(
         name=str(body.get("name", "Custom Site")),
         latitude_deg=float(body.get("latitude_deg", STATE.observer.latitude_deg)),
@@ -149,9 +150,9 @@ async def create_site_preset(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 @router.put("/location-time")
-async def sync_location_and_time(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def sync_location_and_time(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Sync observer GPS coordinates and UTC clock delta from smartphone browser or preset."""
-    body = payload or {}
+    body = ensure_body_dict(payload)
     if "latitude_deg" in body:
         STATE.observer.latitude_deg = float(body["latitude_deg"])
     if "longitude_deg" in body:
@@ -182,8 +183,8 @@ async def get_storage_status() -> Dict[str, Any]:
 
 
 @router.post("/storage/select")
-async def select_storage_volume(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def select_storage_volume(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     path = str(body.get("path", ""))
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
@@ -196,8 +197,8 @@ async def select_storage_volume(payload: Dict[str, Any] = None) -> Dict[str, Any
 
 
 @router.post("/storage/eject")
-async def eject_usb_storage(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def eject_usb_storage(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     try:
         res = STORAGE.safe_eject_usb(mount_point=body.get("mount_point"))
         await STATE.broadcast("STATE_SNAPSHOT", STATE.snapshot())

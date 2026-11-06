@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ..sequencer.engine import SEQUENCER
 from ..state import STATE
-from ..web_compat import APIRouter, HTTPException
+from ..web_compat import APIRouter, Body, HTTPException
+from .schemas import ensure_body_dict
 
 router = APIRouter(prefix="/api/sequence", tags=["sequence"])
 
@@ -35,8 +36,8 @@ async def list_sequence_plans() -> Dict[str, Any]:
 
 
 @router.post("/plans")
-async def save_sequence_plan(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def save_sequence_plan(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     name = str(body.get("name", "Imaging Plan"))
     target_name = str(body.get("target_name", STATE.framing_state.get("target_name", "Target")))
     steps = body.get("steps") or [
@@ -64,8 +65,11 @@ async def delete_sequence_plan(plan_id: str) -> Dict[str, Any]:
 
 
 @router.post("/plans/{plan_id}/start")
-async def start_sequence_plan(plan_id: str, payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def start_sequence_plan(
+    plan_id: str,
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     reset_progress = bool(body.get("reset_progress", False))
     try:
         plan = await SEQUENCER.start_plan(plan_id, reset_progress=reset_progress)
@@ -85,8 +89,8 @@ async def resume_sequence() -> Dict[str, Any]:
 
 
 @router.post("/confirm-interlock")
-async def confirm_sequence_interlock(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def confirm_sequence_interlock(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     exp_override = float(body["exposure_s"]) if "exposure_s" in body and body["exposure_s"] is not None else None
     iso_override = str(body["iso"]) if "iso" in body and body["iso"] is not None else None
     return await SEQUENCER.confirm_interlock(

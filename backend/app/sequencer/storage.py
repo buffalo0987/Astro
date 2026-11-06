@@ -241,6 +241,7 @@ class StorageManager:
         fwhm_arcsec: float,
         star_count: int,
         bg_median_adu: float,
+        eccentricity: float = 0.0,
         solved_ra_hours: Optional[float] = None,
         solved_dec_deg: Optional[float] = None,
         thumbnail_path: Optional[str] = None,
@@ -253,9 +254,9 @@ class StorageManager:
                 INSERT INTO captured_frames (
                     id, session_id, plan_id, filename, relative_path, frame_type,
                     exposure_s, iso, sequence_num, file_size_bytes,
-                    hfr_median, fwhm_Arcsec, star_count, bg_median_adu,
+                    hfr_median, fwhm_Arcsec, eccentricity, star_count, bg_median_adu,
                     solved_ra_hours, solved_dec_deg, status, thumbnail_path, captured_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)
                 """,
                 (
                     frame_id,
@@ -270,6 +271,7 @@ class StorageManager:
                     file_size_bytes,
                     hfr_median,
                     fwhm_arcsec,
+                    eccentricity,
                     star_count,
                     bg_median_adu,
                     solved_ra_hours,
@@ -334,6 +336,7 @@ class StorageManager:
             "sequence_num",
             "hfr_median",
             "fwhm_Arcsec",
+            "eccentricity",
             "star_count",
             "bg_median_adu",
             "status",
@@ -644,6 +647,42 @@ class StorageManager:
 
         return {"rejected_count": len(rejected_ids), "rejected_ids": rejected_ids}
 
+    def cull_trailed_frames(
+        self,
+        session_id: str,
+        max_eccentricity: float = 0.65,
+    ) -> Dict[str, Any]:
+        """Move accepted Light frames with star eccentricity >= max_eccentricity to rejected/ on user request."""
+        with DB.connection() as conn:
+            lights = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT * FROM captured_frames
+                    WHERE session_id = ? AND LOWER(frame_type) = 'light' AND status = 'accepted'
+                    """,
+                    (session_id,),
+                ).fetchall()
+            ]
+
+        rejected_ids: List[str] = []
+        for fr in lights:
+            ecc_val = float(fr.get("eccentricity") or 0.0)
+            stars_val = int(fr.get("star_count") or 0)
+            if stars_val >= 2 and ecc_val >= max_eccentricity:
+                self.set_frame_cull_status(
+                    fr["id"],
+                    "rejected",
+                    f"Star trailing (e={ecc_val:.2f} >= {max_eccentricity:.2f})",
+                )
+                rejected_ids.append(fr["id"])
+
+        return {
+            "rejected_count": len(rejected_ids),
+            "rejected_ids": rejected_ids,
+            "max_eccentricity": max_eccentricity,
+        }
+
     def list_sessions_with_stats(self) -> List[Dict[str, Any]]:
         with DB.connection() as conn:
             sessions = [
@@ -675,6 +714,15 @@ class StorageManager:
                 ]
                 s["best_hfr"] = round(min(light_hfrs), 2) if light_hfrs else None
                 s["median_hfr"] = round(float(np.median(light_hfrs)), 2) if light_hfrs else None
+                light_eccs = [
+                    float(f.get("eccentricity") or 0.0)
+                    for f in frames
+                    if f["frame_type"].lower() == "light"
+                    and f["status"] == "accepted"
+                    and int(f.get("star_count") or 0) > 0
+                ]
+                s["median_eccentricity"] = round(float(np.median(light_eccs)), 2) if light_eccs else None
+                s["trailed_frames"] = sum(1 for e in light_eccs if e >= 0.65)
                 accepted = [f for f in frames if f["status"] == "accepted"]
                 s["frame_counts"] = {
                     "light": sum(1 for f in accepted if f["frame_type"].lower() == "light"),

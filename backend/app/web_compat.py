@@ -1,8 +1,9 @@
-"""FastAPI / ASGI Compatibility Layer.
+"""FastAPI / ASGI Runtime & Offline Sandbox Test Adapter.
 
-Imports native FastAPI when installed on the Raspberry Pi 4, and falls back to a
-lightweight Tornado + asyncio implementation when running in minimal environments
-where FastAPI is not installed.
+Uses native FastAPI + Starlette + ORJSONResponse + Uvicorn (uvloop/httptools) in
+production on the Raspberry Pi 4, while retaining a lightweight zero-dependency
+ASGI/test adapter so the automated test suite and simulator run in offline dev
+environments where FastAPI is not installed.
 """
 
 from __future__ import annotations
@@ -13,16 +14,81 @@ import json
 import mimetypes
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("application/javascript", ".js")
+
 try:
-    from fastapi import APIRouter, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect  # type: ignore
-    from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse  # type: ignore
+    import orjson as _orjson  # type: ignore
+
+    HAS_ORJSON = True
+except Exception:
+    _orjson = None
+    HAS_ORJSON = False
+
+try:
+    import uvloop as _uvloop  # type: ignore  # noqa: F401
+
+    HAS_UVLOOP = True
+except Exception:
+    HAS_UVLOOP = False
+
+try:
+    import httptools as _httptools  # type: ignore  # noqa: F401
+
+    HAS_HTTPTOOLS = True
+except Exception:
+    HAS_HTTPTOOLS = False
+
+
+def json_dumps_bytes(data: Any) -> bytes:
+    """Serialize data to UTF-8 JSON bytes using SIMD orjson when available."""
+    if HAS_ORJSON and _orjson is not None:
+        return _orjson.dumps(data)
+    return json.dumps(data).encode("utf-8")
+
+
+def json_dumps(data: Any) -> str:
+    """Serialize data to a JSON string using SIMD orjson when available."""
+    if HAS_ORJSON and _orjson is not None:
+        return _orjson.dumps(data).decode("utf-8")
+    return json.dumps(data)
+
+
+try:
+    from fastapi import (  # type: ignore
+        APIRouter,
+        Body,
+        FastAPI,
+        HTTPException,
+        Request,
+        WebSocket,
+        WebSocketDisconnect,
+    )
+    from fastapi.responses import (  # type: ignore
+        FileResponse,
+        JSONResponse,
+        Response,
+        StreamingResponse,
+    )
     from fastapi.staticfiles import StaticFiles  # type: ignore
+
+    if HAS_ORJSON:
+        try:
+            from fastapi.responses import ORJSONResponse as DefaultJSONResponse  # type: ignore
+        except Exception:
+            DefaultJSONResponse = JSONResponse
+    else:
+        DefaultJSONResponse = JSONResponse
+
     HAS_NATIVE_FASTAPI = True
 except Exception:
     HAS_NATIVE_FASTAPI = False
+
+    def Body(default: Any = None, **_: Any) -> Any:  # noqa: N802
+        return default
 
     class HTTPException(Exception):
         def __init__(self, status_code: int = 400, detail: str = "Error") -> None:
@@ -41,10 +107,16 @@ except Exception:
             headers: Optional[Dict[str, str]] = None,
             media_type: str = "application/octet-stream",
         ) -> None:
-            self.content = content.encode("utf-8") if isinstance(content, str) else content
+            self._content: Optional[bytes] = (
+                content.encode("utf-8") if isinstance(content, str) else content
+            )
             self.status_code = status_code
             self.headers = dict(headers or {})
             self.media_type = media_type
+
+        @property
+        def content(self) -> bytes:
+            return self._content or b""
 
     class JSONResponse(Response):
         def __init__(
@@ -54,13 +126,19 @@ except Exception:
             headers: Optional[Dict[str, str]] = None,
         ) -> None:
             super().__init__(
-                content=json.dumps(content).encode("utf-8"),
+                content=json_dumps_bytes(content),
                 status_code=status_code,
                 headers=headers,
                 media_type="application/json",
             )
 
+    DefaultJSONResponse = JSONResponse
+
     class FileResponse(Response):
+        """Chunk-streamable file response that avoids eager RAM reads until needed."""
+
+        CHUNK_SIZE = 65536
+
         def __init__(
             self,
             path: str | Path,
@@ -71,16 +149,33 @@ except Exception:
             p = Path(path)
             if not p.is_file():
                 raise HTTPException(status_code=404, detail=f"File not found: {p.name}")
+            self.file_path = p
             mtype = media_type or mimetypes.guess_type(str(p))[0] or "application/octet-stream"
             hdrs = dict(headers or {})
             if filename:
                 hdrs["Content-Disposition"] = f'attachment; filename="{filename}"'
+            hdrs.setdefault("Content-Length", str(p.stat().st_size))
             super().__init__(
-                content=p.read_bytes(),
+                content=b"",
                 status_code=200,
                 headers=hdrs,
                 media_type=mtype,
             )
+            self._content = None
+
+        @property
+        def content(self) -> bytes:
+            if self._content is None:
+                self._content = self.file_path.read_bytes()
+            return self._content
+
+        def iter_chunks(self) -> Iterator[bytes]:
+            with self.file_path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(self.CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    yield chunk
 
     class StreamingResponse:
         def __init__(
@@ -137,7 +232,7 @@ except Exception:
                 await res
 
         async def send_json(self, data: Any) -> None:
-            await self.send_text(json.dumps(data))
+            await self.send_text(json_dumps(data))
 
         async def receive_text(self) -> str:
             res = self._recv_cb()
@@ -172,10 +267,17 @@ except Exception:
             return lambda fn: self._add("DELETE", path, fn)
 
     class FastAPI(APIRouter):
-        def __init__(self, title: str = "AstroPi", version: str = "1.0.0", **_: Any) -> None:
+        def __init__(
+            self,
+            title: str = "AstroPi",
+            version: str = "1.0.0",
+            lifespan: Optional[Callable[[Any], Any]] = None,
+            **_: Any,
+        ) -> None:
             super().__init__(prefix="")
             self.title = title
             self.version = version
+            self.lifespan = lifespan
             self.ws_routes: Dict[str, Callable[..., Any]] = {}
             self.startup_handlers: List[Callable[[], Any]] = []
             self.shutdown_handlers: List[Callable[[], Any]] = []
@@ -191,6 +293,7 @@ except Exception:
             def _wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
                 self.ws_routes[path] = fn
                 return fn
+
             return _wrap
 
         def on_event(self, event_type: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -200,6 +303,7 @@ except Exception:
                 elif event_type == "shutdown":
                     self.shutdown_handlers.append(fn)
                 return fn
+
             return _wrap
 
         def mount(self, path: str, app: StaticFiles, name: Optional[str] = None) -> None:
@@ -208,10 +312,12 @@ except Exception:
 
 def _compile_route_pattern(route_path: str) -> Tuple[re.Pattern[str], List[str]]:
     param_names: List[str] = []
+
     def _repl(match: re.Match[str]) -> str:
         pname = match.group(1)
         param_names.append(pname)
         return r"([^/]+)"
+
     regex_str = "^" + re.sub(r"\{([a-zA-Z0-9_]+)\}", _repl, route_path) + "$"
     return re.compile(regex_str), param_names
 
@@ -222,8 +328,8 @@ async def dispatch_http_request(
     url: str,
     body_bytes: bytes = b"",
     headers: Optional[Dict[str, str]] = None,
-) -> Tuple[int, Dict[str, str], bytes]:
-    """Dispatch an HTTP request against our FastAPI or shim app and return (status, headers, body)."""
+) -> Tuple[int, Dict[str, str], Any]:
+    """Dispatch an HTTP request against the fallback router and return (status, headers, body_or_file)."""
     parsed = urlparse(url)
     path = parsed.path or "/"
     raw_qs = parse_qs(parsed.query, keep_blank_values=True)
@@ -238,13 +344,20 @@ async def dispatch_http_request(
             continue
 
         path_params = {name: val for name, val in zip(pnames, m.groups())}
-        req_obj = Request(method=method.upper(), path=path, query_params=query_params, body_bytes=body_bytes, headers=headers)
+        req_obj = Request(
+            method=method.upper(),
+            path=path,
+            query_params=query_params,
+            body_bytes=body_bytes,
+            headers=headers,
+        )
         json_body: Any = None
         if body_bytes:
             try:
                 json_body = json.loads(body_bytes.decode("utf-8"))
-            except Exception:
-                json_body = {}
+            except Exception as exc:
+                err_bytes = json_dumps_bytes({"detail": f"Invalid JSON body: {exc}"})
+                return 422, {"Content-Type": "application/json"}, err_bytes
 
         sig = inspect.signature(handler)
         kwargs: Dict[str, Any] = {}
@@ -259,7 +372,13 @@ async def dispatch_http_request(
             elif pname in ("request", "req") or param.annotation in (Request, "Request"):
                 kwargs[pname] = req_obj
             elif pname in ("payload", "body", "data"):
-                kwargs[pname] = json_body if isinstance(json_body, dict) else {}
+                if json_body is None:
+                    kwargs[pname] = None if param.default is None else param.default
+                elif isinstance(json_body, dict):
+                    kwargs[pname] = json_body
+                else:
+                    err_bytes = json_dumps_bytes({"detail": "Payload must be a JSON object"})
+                    return 422, {"Content-Type": "application/json"}, err_bytes
             elif pname in query_params:
                 qval: Any = query_params[pname]
                 ann = str(param.annotation)
@@ -278,10 +397,10 @@ async def dispatch_http_request(
             if inspect.iscoroutine(res):
                 res = await res
         except HTTPException as hexc:
-            err_bytes = json.dumps({"detail": hexc.detail}).encode("utf-8")
+            err_bytes = json_dumps_bytes({"detail": hexc.detail})
             return hexc.status_code, {"Content-Type": "application/json"}, err_bytes
         except Exception as exc:
-            err_bytes = json.dumps({"detail": str(exc)}).encode("utf-8")
+            err_bytes = json_dumps_bytes({"detail": str(exc)})
             return 500, {"Content-Type": "application/json"}, err_bytes
 
         if isinstance(res, StreamingResponse):
@@ -296,25 +415,36 @@ async def dispatch_http_request(
             hdrs = {"Content-Type": res.media_type, **res.headers}
             return res.status_code, hdrs, b"".join(chunks)
 
+        if not HAS_NATIVE_FASTAPI and isinstance(res, FileResponse):
+            hdrs = {"Content-Type": res.media_type, **res.headers}
+            return res.status_code, hdrs, res
+
         if isinstance(res, Response):
             hdrs = {"Content-Type": res.media_type, **res.headers}
             return res.status_code, hdrs, res.content
 
-        out_bytes = json.dumps(res).encode("utf-8")
+        out_bytes = json_dumps_bytes(res)
         return 200, {"Content-Type": "application/json"}, out_bytes
 
-    # Check static file mounts
+    # Static file mounts
     for mount_prefix, static_app in getattr(app, "static_mounts", []):
         if path.startswith(mount_prefix):
             rel = path[len(mount_prefix) :].lstrip("/") or "index.html"
             candidate = (static_app.directory / rel).resolve()
-            if not candidate.is_file() and static_app.html:
-                candidate = (static_app.directory / "index.html").resolve()
+            if not str(candidate).startswith(str(static_app.directory.resolve())):
+                break
+            if candidate.is_dir() and static_app.html:
+                candidate = candidate / "index.html"
             if candidate.is_file():
-                mtype = mimetypes.guess_type(str(candidate))[0] or "text/html"
-                return 200, {"Content-Type": mtype}, candidate.read_bytes()
+                mtype = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+                if candidate.suffix in (".mjs", ".js"):
+                    mtype = "application/javascript; charset=utf-8"
+                hdrs = {"Content-Type": mtype}
+                if "/vendor/" in path:
+                    hdrs["Cache-Control"] = "public, max-age=31536000, immutable"
+                return 200, hdrs, FileResponse(candidate, media_type=mtype, headers=hdrs)
 
-    return 404, {"Content-Type": "application/json"}, json.dumps({"detail": "Not Found"}).encode("utf-8")
+    return 404, {"Content-Type": "application/json"}, json_dumps_bytes({"detail": "Not Found"})
 
 
 class SimpleTestResponse:
@@ -333,11 +463,27 @@ class SimpleTestResponse:
 
 
 class UniversalTestClient:
-    """Synchronous test client that runs against either native FastAPI or our async router."""
+    """Synchronous test client exercising native Starlette/FastAPI TestClient on Pi or async router offline."""
 
     def __init__(self, app: Any) -> None:
         self.app = app
+        self._native_client: Any = None
+        self._lifespan_cm: Any = None
+        if HAS_NATIVE_FASTAPI:
+            try:
+                from fastapi.testclient import TestClient  # type: ignore
+
+                self._native_client = TestClient(app)
+                self._native_client.__enter__()
+                return
+            except Exception:
+                self._native_client = None
+
         self._loop = asyncio.new_event_loop()
+        lifespan_fn = getattr(self.app, "lifespan", None)
+        if callable(lifespan_fn):
+            self._lifespan_cm = lifespan_fn(self.app)
+            self._loop.run_until_complete(self._lifespan_cm.__aenter__())
         for fn in getattr(self.app, "startup_handlers", []):
             res = fn()
             if inspect.iscoroutine(res):
@@ -350,11 +496,16 @@ class UniversalTestClient:
         json_body: Any = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> SimpleTestResponse:
-        body_bytes = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
-        status, hdrs, content = self._loop.run_until_complete(
+        if self._native_client is not None:
+            resp = self._native_client.request(method, url, json=json_body, headers=headers)
+            return SimpleTestResponse(resp.status_code, dict(resp.headers), resp.content)
+
+        body_bytes = json_dumps_bytes(json_body) if json_body is not None else b""
+        status, hdrs, payload = self._loop.run_until_complete(
             dispatch_http_request(self.app, method, url, body_bytes=body_bytes, headers=headers)
         )
-        return SimpleTestResponse(status, hdrs, content)
+        raw_bytes = payload.content if hasattr(payload, "content") else bytes(payload)
+        return SimpleTestResponse(status, hdrs, raw_bytes)
 
     def get(self, url: str, headers: Optional[Dict[str, str]] = None) -> SimpleTestResponse:
         return self.request("GET", url, headers=headers)
@@ -369,6 +520,13 @@ class UniversalTestClient:
         return self.request("DELETE", url, headers=headers)
 
     def close(self) -> None:
+        if self._native_client is not None:
+            self._native_client.__exit__(None, None, None)
+            self._native_client = None
+            return
+        if self._lifespan_cm is not None:
+            self._loop.run_until_complete(self._lifespan_cm.__aexit__(None, None, None))
+            self._lifespan_cm = None
         for fn in getattr(self.app, "shutdown_handlers", []):
             res = fn()
             if inspect.iscoroutine(res):

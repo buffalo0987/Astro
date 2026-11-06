@@ -15,8 +15,9 @@ from ..hardware.camera_actor import CAMERA
 from ..hardware.simulated_camera import SIM_RIG
 from ..imaging.pipeline import process_and_publish_preview
 from ..state import STATE
-from ..web_compat import APIRouter, HTTPException
+from ..web_compat import APIRouter, Body, HTTPException
 from .routes_pa import stop_pa_live_loop
+from .schemas import ensure_body_dict
 
 router = APIRouter(prefix="/api/framing", tags=["framing_focus"])
 
@@ -56,8 +57,8 @@ async def list_dso_catalog(
 
 
 @router.post("/catalog/import-csv")
-async def import_catalog_csv(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def import_catalog_csv(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     csv_text = str(body.get("csv_text", ""))
     if not csv_text.strip():
         raise HTTPException(status_code=400, detail="csv_text is required")
@@ -66,8 +67,8 @@ async def import_catalog_csv(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 @router.post("/select-target")
-async def select_framing_target(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def select_framing_target(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     target_id = str(body.get("target_id", "CUSTOM"))
     target_name = str(body.get("target_name", "Custom Target"))
     ra_raw = body.get("target_ra_hours", body.get("ra", 20.988))
@@ -116,9 +117,9 @@ async def select_framing_target(payload: Dict[str, Any] = None) -> Dict[str, Any
 
 
 @router.post("/solve")
-async def capture_and_solve_framing(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def capture_and_solve_framing(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     """Capture a fast JPEG in /dev/shm, plate-solve via ASTAP, compute Push-To vectors, and restore RAW."""
-    body = payload or {}
+    body = ensure_body_dict(payload)
     exposure_s = float(body.get("exposure_s", 2.0))
     iso = str(body.get("iso", "1600"))
     restore_raw = bool(body.get("restore_raw", True))
@@ -195,8 +196,8 @@ async def capture_and_solve_framing(payload: Dict[str, Any] = None) -> Dict[str,
 
 
 @router.post("/focus-roi")
-async def set_focus_roi(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    body = payload or {}
+async def set_focus_roi(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    body = ensure_body_dict(payload)
     if body.get("clear", False) or body.get("roi") is None:
         STATE.focus_state["roi"] = None
     else:
@@ -214,9 +215,9 @@ async def set_focus_roi(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
 
 @router.post("/focus-step")
-async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Capture a fast focus frame, compute full-field or 1:1 ROI HFR/FWHM, and append V-curve history."""
-    body = payload or {}
+async def capture_focus_step(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+    """Capture a fast focus frame, compute full-field or 1:1 ROI HFR/FWHM/Eccentricity, and append history."""
+    body = ensure_body_dict(payload)
     exposure_s = float(body.get("exposure_s", 1.6))
     iso = str(body.get("iso", "1600"))
     restore_raw = bool(body.get("restore_raw", not STATE.focus_state.get("loop_running", False)))
@@ -262,6 +263,8 @@ async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
 
         hfr = float(metrics["hfr_median"])
         fwhm = float(metrics["fwhm_arcsec"])
+        ecc = float(metrics.get("eccentricity_median", 0.0))
+        rlabel = str(metrics.get("roundness_label", "Round"))
         scount = int(metrics["star_count"])
 
         prev_min = STATE.focus_state.get("min_hfr_achieved")
@@ -275,6 +278,7 @@ async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
                     "timestamp": round(time.time(), 1),
                     "hfr": hfr,
                     "fwhm": fwhm,
+                    "eccentricity": ecc,
                     "stars": scount,
                 }
             )
@@ -285,6 +289,8 @@ async def capture_focus_step(payload: Dict[str, Any] = None) -> Dict[str, Any]:
             {
                 "hfr_median": hfr,
                 "fwhm_arcsec": fwhm,
+                "eccentricity_median": ecc,
+                "roundness_label": rlabel,
                 "star_count": scount,
                 "history": history,
             }
@@ -321,9 +327,9 @@ async def _focus_loop_worker(exposure_s: float, iso: str) -> None:
 
 
 @router.post("/focus-loop/start")
-async def start_focus_loop(payload: Dict[str, Any] = None) -> Dict[str, Any]:
+async def start_focus_loop(payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
     global _focus_loop_task
-    body = payload or {}
+    body = ensure_body_dict(payload)
     exposure_s = float(body.get("exposure_s", 1.6))
     iso = str(body.get("iso", "1600"))
     await stop_pa_live_loop({"restore_raw": False})

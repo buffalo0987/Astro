@@ -1,11 +1,24 @@
-const CACHE_NAME = 'astropi-pwa-v5';
+const CACHE_NAME = 'astropi-pwa-v6';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/manifest.webmanifest',
   '/icon.svg',
   '/assets/app.css',
-  '/assets/app.js'
+  '/assets/app.js',
+  '/assets/audio.js',
+  '/assets/catalog.js',
+  '/assets/store.js',
+  '/assets/vendor/preact.mjs',
+  '/assets/vendor/hooks.mjs',
+  '/assets/vendor/htm.mjs',
+  '/assets/components/HudBar.js',
+  '/assets/components/SkyViewport.js',
+  '/assets/views/PolarAlignView.js',
+  '/assets/views/FrameFocusView.js',
+  '/assets/views/SequenceView.js',
+  '/assets/views/OffloadView.js',
+  '/assets/views/SystemDrawer.js',
 ];
 
 self.addEventListener('install', (event) => {

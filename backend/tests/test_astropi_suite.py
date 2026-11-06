@@ -667,6 +667,205 @@ class TestAstroPiSuite(unittest.TestCase):
         self.assertEqual(d_cluster["iso"], "400")
         self.assertIn("Star", d_cluster["limiting_factor"])
 
+    def test_11_pyerfa_6tuple_contract_and_star_eccentricity_culling(self) -> None:
+        """Verify pyerfa 6-tuple unpacking, round vs. trailed star eccentricity, 14-bit linear flux, and 1-tap cull-trailed."""
+        from app.astrometry import coordinates as coord_mod
+        from app.imaging.focus_metrics import compute_star_hfr_metrics
+        from app.imaging.light_exposure_solver import estimate_sky_and_star_flux
+        from app.sequencer.storage import STORAGE
+
+        # 1. Verify pyerfa.atco13 6-tuple return contract + 2-part JD split
+        calls = []
+
+        class _MockErfa:
+            @staticmethod
+            def atco13(rc, dc, pr, pd, px, rv, utc1, utc2, dut1, elong, phi, hm, xp, yp, phpa, tc, rh, wl):
+                calls.append((utc1, utc2))
+                # Real pyerfa.atco13 returns a 6-tuple: (aob, zob, hob, dob, rob, eo)
+                return (np.deg2rad(135.0), np.deg2rad(30.0), 0.1, dc, rc, 0.0)
+
+        orig_has_erfa = coord_mod.HAS_ERFA
+        orig_erfa = coord_mod._erfa
+        try:
+            coord_mod.HAS_ERFA = True
+            coord_mod._erfa = _MockErfa()
+            obs = ObserverLocation(latitude_deg=35.3395, longitude_deg=-97.4867, elevation_m=360.0)
+            alt_deg, az_deg = coord_mod.j2000_to_topocentric_altaz(
+                ra_hours=20.988,
+                dec_deg=44.33,
+                utc_timestamp=1730000000.0,
+                observer=obs,
+            )
+            self.assertAlmostEqual(alt_deg, 60.0, places=5)
+            self.assertAlmostEqual(az_deg, 135.0, places=5)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], 2440587.5)
+        finally:
+            coord_mod.HAS_ERFA = orig_has_erfa
+            coord_mod._erfa = orig_erfa
+
+        # 2. Star Eccentricity: Round pinpoint stars vs. elongated Star Adventurer 2i trailed stars
+        h, w = 320, 480
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        rng = np.random.default_rng(42)
+        centers = [(int(rng.integers(35, w - 35)), int(rng.integers(35, h - 35))) for _ in range(22)]
+
+        round_img = np.full((h, w), 18.0, dtype=np.float32)
+        trailed_img = np.full((h, w), 18.0, dtype=np.float32)
+        for cx, cy in centers:
+            dx = xx - cx
+            dy = yy - cy
+            round_img += 210.0 * np.exp(-(dx * dx + dy * dy) / (2.0 * 2.0**2))
+            # Elongated 3.2:1 along 25-degree RA drift vector
+            u = dx * np.cos(np.deg2rad(25.0)) + dy * np.sin(np.deg2rad(25.0))
+            v = -dx * np.sin(np.deg2rad(25.0)) + dy * np.cos(np.deg2rad(25.0))
+            trailed_img += 210.0 * np.exp(-(u * u / (2.0 * 5.2**2) + v * v / (2.0 * 1.6**2)))
+
+        m_round = compute_star_hfr_metrics(np.clip(round_img, 0, 255).astype(np.uint8))
+        m_trail = compute_star_hfr_metrics(np.clip(trailed_img, 0, 255).astype(np.uint8))
+
+        self.assertGreaterEqual(m_round["star_count"], 10)
+        self.assertLess(m_round["eccentricity_median"], 0.35)
+        self.assertEqual(m_round["roundness_label"], "Round")
+
+        self.assertGreaterEqual(m_trail["star_count"], 10)
+        self.assertGreaterEqual(m_trail["eccentricity_median"], 0.70)
+        self.assertEqual(m_trail["roundness_label"], "Trailed")
+
+        # 3. 14-Bit Linear Bayer Calibration Path vs. Inverse-sRGB Fallback
+        sky_e, star_e, _ = estimate_sky_and_star_flux(
+            hist={"median_adu": 80, "p99_adu": 200},
+            star_metrics={},
+            probe_exposure_s=4.0,
+            probe_iso="1600",
+            linear_stats={"linear_median_norm": 0.25, "linear_p999_norm": 0.50},
+        )
+        self.assertGreater(sky_e, 50.0)
+        self.assertAlmostEqual(star_e / sky_e, 1.0, places=2)
+
+        # 4. Option A Manual Review Policy: trailed subs stay accepted until 1-tap /cull-trailed is invoked
+        sess_dict = STORAGE.ensure_session_directory("EccentricityTest_M31")
+        sid = sess_dict["id"]
+        sdir = Path(sess_dict["directory_path"])
+        try:
+            for idx, ecc in enumerate((0.20, 0.24, 0.76, 0.82), start=1):
+                fname = f"Light_M31_{idx:04d}.CR3"
+                frel = f"lights/{fname}"
+                fpath = sdir / frel
+                fpath.write_bytes(b"CR3DATA" * 128)
+                STORAGE.register_captured_frame(
+                    session_id=sid,
+                    plan_id=None,
+                    filename=fname,
+                    relative_path=frel,
+                    frame_type="Light",
+                    exposure_s=90.0,
+                    iso="800",
+                    sequence_num=idx,
+                    file_size_bytes=1024,
+                    hfr_median=2.4 if ecc < 0.5 else 4.1,
+                    fwhm_arcsec=3.2,
+                    star_count=45,
+                    bg_median_adu=25.0,
+                    eccentricity=ecc,
+                )
+            dname = "Dark_M31_0001.CR3"
+            drel = f"darks/{dname}"
+            dpath = sdir / drel
+            dpath.write_bytes(b"CR3DARK" * 128)
+            STORAGE.register_captured_frame(
+                session_id=sid,
+                plan_id=None,
+                filename=dname,
+                relative_path=drel,
+                frame_type="Dark",
+                exposure_s=90.0,
+                iso="800",
+                sequence_num=1,
+                file_size_bytes=1024,
+                hfr_median=0.0,
+                fwhm_arcsec=0.0,
+                star_count=0,
+                bg_median_adu=10.0,
+                eccentricity=0.0,
+            )
+
+            sessions_before = self.client.get("/api/sessions").json()["sessions"]
+            sess_info = next(s for s in sessions_before if s["id"] == sid)
+            self.assertEqual(sess_info["accepted_frames"], 5)
+            self.assertEqual(sess_info["rejected_frames"], 0)
+            self.assertEqual(sess_info["trailed_frames"], 2)
+
+            cull_res = self.client.post(f"/api/sessions/{sid}/cull-trailed", json={"max_eccentricity": 0.65})
+            self.assertEqual(cull_res.status_code, 200)
+            self.assertEqual(cull_res.json()["rejected_count"], 2)
+
+            sessions_after = self.client.get("/api/sessions").json()["sessions"]
+            sess_after = next(s for s in sessions_after if s["id"] == sid)
+            self.assertEqual(sess_after["accepted_frames"], 3)
+            self.assertEqual(sess_after["rejected_frames"], 2)
+            self.assertEqual(sess_after["trailed_frames"], 0)
+        finally:
+            self.client.delete(f"/api/sessions/{sid}")
+
+    def test_12_empty_body_routes_and_modular_pwa_es6_integrity(self) -> None:
+        """Verify empty-body POST routes (no 422s), typed 422 validation, and offline ES6 PWA module graph."""
+        import re
+
+        # 1. Empty-body POST routes (matching fetch(url, { method: 'POST' }) with no JSON body)
+        for route in (
+            "/api/camera/preview-stretch",
+            "/api/pa/live-loop/stop",
+            "/api/framing/focus-loop/stop",
+            "/api/sequence/pause",
+            "/api/sequence/abort",
+        ):
+            resp = self.client.post(route)
+            self.assertEqual(resp.status_code, 200, f"Empty-body POST failed on {route}: {resp.text}")
+
+        # Malformed numeric parameter returns clean 422 HTTPException
+        bad_resp = self.client.post("/api/camera/capture", json={"exposure_s": "not-a-number"})
+        self.assertEqual(bad_resp.status_code, 422)
+
+        # Verify active C/Python runtime stack diagnostic flags in /api/system/state
+        sys_state = self.client.get("/api/system/state").json()["system"]
+        self.assertIn("runtime_stack", sys_state)
+        for key in ("pyerfa", "sep", "rawpy", "simplejpeg", "orjson", "uvloop"):
+            self.assertIn(key, sys_state["runtime_stack"])
+
+        # 2. Verify stale Vite prototype tree was removed and ES6 PWA assets + sw.js precache resolve cleanly
+        repo_frontend = CONFIG.frontend_dist_dir.parent
+        self.assertFalse((repo_frontend / "package.json").exists())
+        self.assertFalse((repo_frontend / "src").exists())
+
+        sw_text = (CONFIG.frontend_dist_dir / "sw.js").read_text(encoding="utf-8")
+        self.assertIn("astropi-pwa-v6", sw_text)
+        m_assets = re.search(r"STATIC_ASSETS\s*=\s*\[(.*?)\];", sw_text, re.S)
+        self.assertIsNotNone(m_assets)
+        asset_paths = re.findall(r"['\"]([^'\"]+)['\"]", m_assets.group(1))
+        self.assertGreaterEqual(len(asset_paths), 14)
+
+        for url_path in asset_paths:
+            res = self.client.get(url_path)
+            self.assertEqual(res.status_code, 200, f"Precache asset missing: {url_path}")
+            if url_path.endswith((".js", ".mjs")):
+                self.assertIn("javascript", res.headers.get("content-type", "").lower())
+
+        # 3. Verify every relative ES6 import across all .js / .mjs files resolves on disk & exists in sw.js
+        js_files = list((CONFIG.frontend_dist_dir / "assets").rglob("*.js")) + list(
+            (CONFIG.frontend_dist_dir / "assets").rglob("*.mjs")
+        )
+        self.assertGreaterEqual(len(js_files), 11)
+        import_re = re.compile(r"^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]", re.M)
+        for jf in js_files:
+            rel_url = "/" + str(jf.relative_to(CONFIG.frontend_dist_dir)).replace("\\", "/")
+            self.assertIn(rel_url, asset_paths, f"Module {rel_url} missing from sw.js STATIC_ASSETS!")
+            code = jf.read_text(encoding="utf-8")
+            for spec in import_re.findall(code):
+                self.assertTrue(spec.startswith("."), f"Non-offline external import {spec} in {jf}")
+                resolved = (jf.parent / spec).resolve()
+                self.assertTrue(resolved.is_file(), f"Broken import {spec} in {jf} -> {resolved}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
