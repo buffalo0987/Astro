@@ -17,7 +17,8 @@ ExecStart=/opt/astropi/venv/bin/python3 -m app.main
 Restart=always
 RestartSec=3
 Nice=-10
-MemoryMax=512M
+MemoryHigh=768M
+MemoryMax=1536M
 TimeoutStopSec=10
 
 [Install]

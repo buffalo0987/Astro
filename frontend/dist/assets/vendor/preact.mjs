@@ -239,12 +239,12 @@ function setSingleProp(dom, name, prevVal, nextVal, isSvg, isSelectTag) {
     const evName = name.slice(2).toLowerCase();
     if (!dom._listeners) dom._listeners = {};
     const hadListener = Boolean(dom._listeners[evName]);
+    const opts = (evName === 'touchstart' || evName === 'touchmove') ? { passive: false } : false;
     dom._listeners[evName] = nextVal;
     if (nextVal && !hadListener) {
-      const opts = (evName === 'touchstart' || evName === 'touchmove') ? { passive: false } : false;
       dom.addEventListener(evName, eventProxy, opts);
     } else if (!nextVal && hadListener) {
-      dom.removeAttribute?.(name);
+      dom.removeEventListener?.(evName, eventProxy, opts);
     }
     return;
   }

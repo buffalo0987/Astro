@@ -839,11 +839,21 @@ class TestAstroPiSuite(unittest.TestCase):
         self.assertFalse((repo_frontend / "src").exists())
 
         sw_text = (CONFIG.frontend_dist_dir / "sw.js").read_text(encoding="utf-8")
-        self.assertIn("astropi-pwa-v6", sw_text)
+        self.assertIn("astropi-pwa-v7", sw_text)
         m_assets = re.search(r"STATIC_ASSETS\s*=\s*\[(.*?)\];", sw_text, re.S)
         self.assertIsNotNone(m_assets)
         asset_paths = re.findall(r"['\"]([^'\"]+)['\"]", m_assets.group(1))
         self.assertGreaterEqual(len(asset_paths), 14)
+
+        # Verify systemd memory headroom & dual-server Uvicorn lifecycle/signal hardening
+        repo_root = CONFIG.frontend_dist_dir.parent.parent
+        service_unit = (repo_root / "deploy" / "astropi.service").read_text(encoding="utf-8")
+        self.assertIn("MemoryHigh=768M", service_unit)
+        self.assertIn("MemoryMax=1536M", service_unit)
+        main_src = (repo_root / "backend" / "app" / "main.py").read_text(encoding="utf-8")
+        self.assertIn("uvloop.install()", main_src)
+        self.assertIn('"lifespan": "off"', main_src)
+        self.assertIn("async with lifespan(app):", main_src)
 
         for url_path in asset_paths:
             res = self.client.get(url_path)

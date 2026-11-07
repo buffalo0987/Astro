@@ -302,7 +302,9 @@ def decode_cr3_preview_array(
                     half = max(32, int(rsize * 0.5))
                     x0, x1 = max(0, cx - half), min(w, cx + half)
                     y0, y1 = max(0, cy - half), min(h, cy + half)
-                    rgb16 = rgb16[y0:y1, x0:x1].copy()
+                    crop16 = rgb16[y0:y1, x0:x1].copy()
+                    del rgb16
+                    rgb16 = crop16
             gc.collect()
             return rgb16, "RAW_LINEAR_16BIT"
         except Exception:

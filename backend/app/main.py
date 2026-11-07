@@ -108,21 +108,38 @@ if CONFIG.frontend_dist_dir.exists():
 def run_server(host: str = "0.0.0.0", port: int = 8000, ssl_port: int = 8443) -> None:
     """Start the single-worker headless server with dual HTTP (8000) and HTTPS Secure Context (8443)."""
     if HAS_NATIVE_FASTAPI:
+        import inspect
+        import signal
         import uvicorn  # type: ignore
 
+        try:
+            import uvloop  # type: ignore
+
+            uvloop.install()
+        except ImportError:
+            pass
+
         _, srv_cert, srv_key = routes_system.ensure_local_root_ca()
+        cfg_params = inspect.signature(uvicorn.Config.__init__).parameters
 
         async def _run_dual() -> None:
-            common_kwargs = {
+            common_kwargs: dict[str, Any] = {
                 "host": host,
                 "log_level": "info",
                 "loop": "auto",
                 "http": "auto",
+                "lifespan": "off",
                 "ws_ping_interval": 20.0,
                 "ws_ping_timeout": 20.0,
             }
+            if "timeout_graceful_shutdown" in cfg_params:
+                common_kwargs["timeout_graceful_shutdown"] = 3
+
             c_http = uvicorn.Config(app, port=port, **common_kwargs)
             s_http = uvicorn.Server(c_http)
+            s_http.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+            servers = [s_http]
+
             if srv_cert.is_file() and srv_key.is_file():
                 c_https = uvicorn.Config(
                     app,
@@ -132,11 +149,25 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, ssl_port: int = 8443) ->
                     **common_kwargs,
                 )
                 s_https = uvicorn.Server(c_https)
+                s_https.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+                servers.append(s_https)
+
+            def _trigger_shutdown() -> None:
+                for srv in servers:
+                    srv.should_exit = True
+
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, _trigger_shutdown)
+                except NotImplementedError:
+                    signal.signal(sig, lambda *_: _trigger_shutdown())
+
+            async with lifespan(app):
                 print(f"AstroPi HTTP Server listening on http://{host}:{port}")
-                print(f"AstroPi HTTPS (Secure Context / PWA) listening on https://{host}:{ssl_port}")
-                await asyncio.gather(s_http.serve(), s_https.serve())
-            else:
-                await s_http.serve()
+                if len(servers) > 1:
+                    print(f"AstroPi HTTPS (Secure Context / PWA) listening on https://{host}:{ssl_port}")
+                await asyncio.gather(*(srv.serve() for srv in servers))
 
         try:
             asyncio.run(_run_dual())

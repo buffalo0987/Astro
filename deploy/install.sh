@@ -4,12 +4,12 @@
 # ==============================================================================
 # Provisions:
 #   1. libgphoto2, gphoto2, Python 3 venv, rawpy, pyerfa, FastAPI, Uvicorn
-#   2. astap_cli (ARM64) + W08 (wide-field) and D20 star catalogs (/opt/astap)
+#   2. astap_cli (ARM64) + G05 (3°–20° FOV) star catalog (/opt/astap)
 #   3. udev rules & gvfs-gphoto2-volume-monitor suppression for Canon EOS M200
 #   4. Zero-config Samba (SMB3) share (\\astro.local\captures) + Avahi mDNS
 #   5. exFAT / NTFS USB 3.0 external SSD support + udisks2
 #   6. NetworkManager Wi-Fi Auto-Hotspot fallback ("AstroPi-Field" @ 10.42.0.1)
-#   7. systemd service (astropi.service) with MemoryMax=512M
+#   7. systemd service (astropi.service) with MemoryHigh=768M / MemoryMax=1536M
 # ==============================================================================
 
 set -euo pipefail
